@@ -23,7 +23,7 @@ Notes:
 
 - `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster labeled `wavey-us-ord`.
 - The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
-- The worker runtime only needs `encodec` plus PyTorch. Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
+- The worker runtime uses the Wavey `encodec` fork plus PyTorch and a minimal WAV backend (`soundfile`/`libsndfile`). Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
 
 ## GitHub secrets and variables
 

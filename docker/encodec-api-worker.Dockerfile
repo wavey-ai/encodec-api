@@ -58,6 +58,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libsndfile1 \
     python3 \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*
@@ -67,6 +68,7 @@ COPY --from=opus /usr/local/lib/libopus.so* /usr/local/lib/
 RUN python3 -m venv /opt/encodec-env \
   && /opt/encodec-env/bin/pip install --no-cache-dir --upgrade pip \
   && /opt/encodec-env/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch==2.5.1 torchaudio==2.5.1 \
+  && /opt/encodec-env/bin/pip install --no-cache-dir soundfile \
   && /opt/encodec-env/bin/pip install --no-cache-dir "https://github.com/wavey-ai/encodec/archive/${ENCODEC_FORK_REV}.tar.gz"
 
 COPY --from=build /app/target/release/encodec-api /usr/local/bin/encodec-api
