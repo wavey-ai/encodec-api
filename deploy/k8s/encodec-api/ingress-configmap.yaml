@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: encodec-api-ingress-config
+  namespace: encodec-api
+data:
+  ENCODEC_API_ROLE: ingress
+  PORT: "8443"
+  ENABLE_H3: "false"
+  UPLOAD_RESPONSE_NUM_STREAMS: "4"
+  UPLOAD_RESPONSE_SLOT_SIZE_KB: "128"
+  UPLOAD_RESPONSE_SLOTS_PER_STREAM: "512"
+  UPLOAD_RESPONSE_TIMEOUT_MS: "1800000"
+  UPLOAD_RESPONSE_WATCH_POLL_MS: "2"
+  RUST_LOG: encodec_api=info,web_service=info,upload_response=info

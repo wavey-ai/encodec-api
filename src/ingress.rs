@@ -1,0 +1,431 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Request, StatusCode};
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout, Duration};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use upload_response::{
+    response_content_type, CachedIngress, IngressProxyConfig, RequestControl, TailSlot,
+    UploadResponseService,
+};
+use web_service::{
+    BodyStream, HandlerResponse, HandlerResult, ServerError, StreamWriter, WebSocketHandler,
+};
+
+use crate::config::AppConfig;
+use crate::encode::client_error;
+use crate::protocol::{INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL};
+
+#[derive(Clone)]
+pub struct EncodeIngress {
+    config: AppConfig,
+    cached: CachedIngress,
+    service: Arc<UploadResponseService>,
+}
+
+#[derive(Clone)]
+pub struct EncodeIngressWebSocketHandler {
+    ingress: Arc<EncodeIngress>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsClientEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+}
+
+impl EncodeIngress {
+    pub fn new(config: AppConfig, service: Arc<UploadResponseService>) -> Self {
+        Self {
+            config: config.clone(),
+            cached: CachedIngress::new(
+                service.clone(),
+                IngressProxyConfig {
+                    response_timeout_ms: config.upload_response_timeout_ms,
+                    watch_poll_ms: config.upload_response_watch_poll_ms,
+                },
+            ),
+            service,
+        }
+    }
+
+    pub async fn handle_encode(&self, req: Request<()>, body: BodyStream) -> HandlerResponse {
+        match self.handle_encode_inner(req, body).await {
+            Ok(response) => response,
+            Err(error) => error_response(classify_error(&error), error.to_string()),
+        }
+    }
+
+    pub async fn handle_encode_stream(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+        stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        reject_json_requests(&req).map_err(anyhow_to_server_error)?;
+
+        let guard = self
+            .cached
+            .open_streaming_request()
+            .await
+            .map_err(anyhow_to_server_error)?;
+        let stream_id = guard.stream_id();
+
+        self.write_cached_request_headers(stream_id, &req, true)
+            .await
+            .map_err(anyhow_to_server_error)?;
+
+        let body_task = spawn_request_body_task(self.cached.clone(), stream_id, body);
+        let proxy_result = self
+            .cached
+            .proxy_streaming_response(stream_id, stream_writer)
+            .await;
+        let _ = body_task.await;
+        guard.close().await;
+        proxy_result
+    }
+
+    pub async fn handle_encode_websocket(
+        &self,
+        req: Request<()>,
+        stream: WebSocketStream<TokioIo<Upgraded>>,
+    ) -> HandlerResult<()> {
+        let upload_stream = self
+            .cached
+            .open_streaming_request()
+            .await
+            .map_err(anyhow_to_server_error)?;
+        let stream_id = upload_stream.stream_id();
+
+        self.write_cached_request_headers(stream_id, &req, true)
+            .await
+            .map_err(anyhow_to_server_error)?;
+
+        let (sink, mut source) = stream.split();
+        let response_task = tokio::spawn(self.clone().proxy_websocket_response(stream_id, sink));
+        let mut request_ended = false;
+
+        while let Some(frame) = source.next().await {
+            match frame {
+                Ok(Message::Binary(bytes)) => {
+                    if let Err(error) = self.cached.append_request_body(stream_id, bytes).await {
+                        let error = anyhow::anyhow!("failed to cache websocket upload: {error}");
+                        self.write_stream_error_response(stream_id, &error).await;
+                        let _ = self.cached.end_request(stream_id).await;
+                        request_ended = true;
+                        break;
+                    }
+                }
+                Ok(Message::Text(text)) => {
+                    let event =
+                        serde_json::from_str::<WsClientEvent>(&text).unwrap_or(WsClientEvent {
+                            event_type: String::new(),
+                        });
+                    match event.event_type.as_str() {
+                        "KeepAlive" => {
+                            let _ = self
+                                .cached
+                                .append_request_control(stream_id, RequestControl::KeepAlive)
+                                .await;
+                        }
+                        "Finalize" => {
+                            let _ = self
+                                .cached
+                                .append_request_control(stream_id, RequestControl::Finalize)
+                                .await;
+                        }
+                        "CloseStream" => {
+                            if !request_ended {
+                                let _ = self.cached.end_request(stream_id).await;
+                                request_ended = true;
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Message::Ping(_)) => {}
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => {
+                    if !request_ended {
+                        let _ = self.cached.end_request(stream_id).await;
+                        request_ended = true;
+                    }
+                    break;
+                }
+                Ok(Message::Frame(_)) => {}
+                Err(error) => {
+                    let error = anyhow::anyhow!("websocket receive failed: {error}");
+                    self.write_stream_error_response(stream_id, &error).await;
+                    let _ = self.cached.end_request(stream_id).await;
+                    request_ended = true;
+                    break;
+                }
+            }
+        }
+
+        if !request_ended {
+            let _ = self.cached.end_request(stream_id).await;
+        }
+
+        let _ = response_task.await;
+        upload_stream.close().await;
+        Ok(())
+    }
+
+    async fn handle_encode_inner(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+    ) -> Result<HandlerResponse> {
+        reject_json_requests(&req)?;
+
+        let mut guard = self.cached.open_buffered_request().await?;
+        let stream_id = guard.stream_id();
+
+        let result = async {
+            self.write_cached_request_headers(stream_id, &req, false)
+                .await?;
+            self.cached.copy_request_body(stream_id, body).await?;
+            self.cached.end_request(stream_id).await?;
+
+            let rx = guard
+                .take_response_receiver()
+                .ok_or_else(|| anyhow::anyhow!("response receiver missing for buffered request"))?;
+            self.cached.await_response(stream_id, rx).await
+        }
+        .await;
+
+        guard.close().await;
+        result
+    }
+
+    async fn write_cached_request_headers(
+        &self,
+        stream_id: u64,
+        req: &Request<()>,
+        streaming: bool,
+    ) -> Result<()> {
+        self.cached
+            .write_request_headers_with(stream_id, req, |headers| {
+                if streaming {
+                    headers.insert(
+                        HeaderName::from_static(INTERNAL_STREAMING_MODE_HEADER),
+                        HeaderValue::from_static(INTERNAL_STREAMING_MODE_JSONL),
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn proxy_websocket_response(
+        self,
+        stream_id: u64,
+        mut sink: SplitSink<WebSocketStream<TokioIo<Upgraded>>, Message>,
+    ) -> HandlerResult<()> {
+        let timeout_duration = Duration::from_millis(self.config.upload_response_timeout_ms);
+        timeout(timeout_duration, async {
+            let mut poll = interval(Duration::from_millis(
+                self.config.upload_response_watch_poll_ms.max(1),
+            ));
+            let mut last_slot = 0usize;
+            let mut headers_seen = false;
+            let mut stream_json_lines = false;
+            let mut line_buffer = Vec::new();
+
+            loop {
+                poll.tick().await;
+
+                if !headers_seen {
+                    if let Some(headers) = self.service.get_response_headers(stream_id).await {
+                        stream_json_lines = response_content_type(&headers)
+                            .map(|value| value.contains("ndjson"))
+                            .unwrap_or(false);
+                        headers_seen = true;
+                        last_slot = 1;
+                    } else {
+                        continue;
+                    }
+                }
+
+                let current_last = self.service.response_last(stream_id).unwrap_or(0);
+                if current_last <= last_slot {
+                    continue;
+                }
+
+                for slot_id in (last_slot + 1)..=current_last {
+                    match self.service.tail_response(stream_id, slot_id).await {
+                        Some(TailSlot::Body(bytes)) if stream_json_lines => {
+                            line_buffer.extend_from_slice(&bytes);
+                            while let Some(position) =
+                                line_buffer.iter().position(|byte| *byte == b'\n')
+                            {
+                                let line = line_buffer.drain(..=position).collect::<Vec<u8>>();
+                                let line = trim_newline(&line);
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                sink.send(Message::Text(
+                                    String::from_utf8_lossy(line).into_owned().into(),
+                                ))
+                                .await
+                                .map_err(|error| ServerError::Handler(Box::new(error)))?;
+                            }
+                        }
+                        Some(TailSlot::Body(bytes)) => {
+                            send_ws_body_chunk(&mut sink, bytes).await?;
+                        }
+                        Some(TailSlot::End) => {
+                            if stream_json_lines && !line_buffer.is_empty() {
+                                let line = trim_newline(&line_buffer);
+                                if !line.is_empty() {
+                                    sink.send(Message::Text(
+                                        String::from_utf8_lossy(line).into_owned().into(),
+                                    ))
+                                    .await
+                                    .map_err(|error| ServerError::Handler(Box::new(error)))?;
+                                }
+                            }
+                            let _ = sink.close().await;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
+                last_slot = current_last;
+            }
+        })
+        .await
+        .map_err(|_| ServerError::Config("response timeout".into()))?
+    }
+
+    async fn write_stream_error_response(&self, stream_id: u64, error: &anyhow::Error) {
+        self.cached
+            .write_handler_response(
+                stream_id,
+                error_response(classify_error(error), error.to_string()),
+            )
+            .await;
+    }
+}
+
+impl EncodeIngressWebSocketHandler {
+    pub fn new(ingress: Arc<EncodeIngress>) -> Self {
+        Self { ingress }
+    }
+}
+
+#[async_trait]
+impl WebSocketHandler for EncodeIngressWebSocketHandler {
+    async fn handle_websocket(
+        &self,
+        req: Request<()>,
+        stream: WebSocketStream<TokioIo<Upgraded>>,
+    ) -> HandlerResult<()> {
+        self.ingress.handle_encode_websocket(req, stream).await
+    }
+
+    fn can_handle(&self, path: &str) -> bool {
+        path == "/encode/stream"
+    }
+}
+
+fn spawn_request_body_task(
+    cached: CachedIngress,
+    stream_id: u64,
+    body: BodyStream,
+) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let result: Result<()> = async {
+            cached.copy_request_body(stream_id, body).await?;
+            cached.end_request(stream_id).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = &result {
+            cached
+                .write_handler_response(
+                    stream_id,
+                    error_response(classify_error(error), error.to_string()),
+                )
+                .await;
+        }
+
+        result
+    })
+}
+
+async fn send_ws_body_chunk(
+    sink: &mut SplitSink<WebSocketStream<TokioIo<Upgraded>>, Message>,
+    bytes: Bytes,
+) -> HandlerResult<()> {
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        sink.send(Message::Text(text.to_string().into()))
+            .await
+            .map_err(|error| ServerError::Handler(Box::new(error)))
+    } else {
+        sink.send(Message::Binary(bytes))
+            .await
+            .map_err(|error| ServerError::Handler(Box::new(error)))
+    }
+}
+
+fn trim_newline(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+fn reject_json_requests(req: &Request<()>) -> Result<()> {
+    let is_json = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value.starts_with("application/json") || value.ends_with("+json")
+        })
+        .unwrap_or(false);
+
+    if is_json {
+        return Err(client_error(
+            "JSON request bodies are not supported; upload audio bytes instead",
+        ));
+    }
+
+    Ok(())
+}
+
+fn error_response(status: StatusCode, message: String) -> HandlerResponse {
+    HandlerResponse {
+        status,
+        body: Some(Bytes::from(
+            serde_json::to_vec(&json!({ "error": message }))
+                .unwrap_or_else(|_| b"{\"error\":\"serialization failure\"}".to_vec()),
+        )),
+        content_type: Some("application/json".into()),
+        headers: vec![("cache-control".into(), "no-store".into())],
+        etag: None,
+    }
+}
+
+fn classify_error(error: &anyhow::Error) -> StatusCode {
+    if crate::encode::is_client_error(error) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn anyhow_to_server_error(error: anyhow::Error) -> ServerError {
+    ServerError::Config(error.to_string())
+}

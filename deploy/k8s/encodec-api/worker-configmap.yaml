@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: encodec-api-worker-config
+  namespace: encodec-api
+data:
+  ENCODEC_API_ROLE: worker
+  PORT: "8443"
+  ENABLE_H3: "false"
+  FFMPEG_BIN: /usr/bin/ffmpeg
+  ENCODEC_BIN: /opt/encodec-env/bin/encodec
+  UPLOAD_RESPONSE_WORKER_ID: encodec-api-gpu-worker
+  UPLOAD_RESPONSE_WORKER_POLL_MS: "10"
+  UPLOAD_RESPONSE_MAX_INFLIGHT: "1"
+  UPLOAD_RESPONSE_DISCOVERY_DNS: encodec-api-ingress-internal.encodec-api.svc.cluster.local:8443
+  UPLOAD_RESPONSE_DISCOVERY_INTERVAL_MS: "2000"
+  UPLOAD_RESPONSE_INSECURE_TLS: "true"
+  RUST_LOG: encodec_api=info,web_service=info,upload_response=info
