@@ -29,7 +29,9 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    clang \
     git \
+    libclang-dev \
     pkg-config \
     libssl-dev \
   && rm -rf /var/lib/apt/lists/*
