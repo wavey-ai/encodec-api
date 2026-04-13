@@ -24,20 +24,13 @@ spec:
       imagePullSecrets:
         - name: ghcr-wavey-ai
       terminationGracePeriodSeconds: 120
-      tolerations:
-        - key: wavey.ai/gpu
-          operator: Equal
-          value: "true"
-          effect: NoSchedule
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: nvidia.com/gpu.present
-                    operator: In
-                    values:
-                      - "true"
+                    operator: DoesNotExist
       containers:
         - name: worker
           image: ghcr.io/wavey-ai/encodec-api-worker:main
@@ -82,13 +75,11 @@ spec:
             timeoutSeconds: 5
           resources:
             requests:
-              cpu: "2"
-              memory: 8Gi
-              nvidia.com/gpu: "1"
+              cpu: "500m"
+              memory: 1Gi
             limits:
-              cpu: "4"
-              memory: 16Gi
-              nvidia.com/gpu: "1"
+              cpu: "2"
+              memory: 4Gi
       volumes:
         - name: tls
           secret:

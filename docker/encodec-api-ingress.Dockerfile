@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
     pkg-config \
+    libopus-dev \
     libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 
@@ -26,6 +27,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libopus0 \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/target/release/encodec-api /usr/local/bin/encodec-api

@@ -5,7 +5,7 @@
 Current scope:
 
 - split-role service on the Wavey `web-service` crate
-- CPU ingress deployment plus GPU worker deployment
+- CPU ingress deployment plus CPU worker deployment
 - remote workers over `upload-response` with split ingress/worker scaling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
 - Linode LKE deploy workflow and manifests for `encodec.wavey.ai`
@@ -23,7 +23,7 @@ Notes:
 
 - `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster labeled `wavey-us-ord`.
 - The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
-- The worker runtime only needs `encodec` plus CUDA-capable PyTorch. Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
+- The worker runtime only needs `encodec` plus PyTorch. Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
 
 ## GitHub secrets and variables
 

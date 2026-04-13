@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
     pkg-config \
+    libopus-dev \
     libssl-dev \
   && rm -rf /var/lib/apt/lists/*
 
@@ -28,6 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libopus0 \
     python3 \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*

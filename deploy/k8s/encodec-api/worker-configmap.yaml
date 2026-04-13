@@ -8,7 +8,7 @@ data:
   PORT: "8443"
   ENABLE_H3: "false"
   ENCODEC_BIN: /opt/encodec-env/bin/encodec
-  UPLOAD_RESPONSE_WORKER_ID: encodec-api-gpu-worker
+  UPLOAD_RESPONSE_WORKER_ID: encodec-api-worker
   UPLOAD_RESPONSE_WORKER_POLL_MS: "10"
   UPLOAD_RESPONSE_MAX_INFLIGHT: "1"
   UPLOAD_RESPONSE_DISCOVERY_DNS: encodec-api-ingress-internal.encodec-api.svc.cluster.local:8443
