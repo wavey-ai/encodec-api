@@ -22,8 +22,22 @@ spec:
     spec:
       serviceAccountName: encodec-api
       imagePullSecrets:
-        - name: ghcr
+        - name: ghcr-wavey-ai
       terminationGracePeriodSeconds: 120
+      tolerations:
+        - key: wavey.ai/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.present
+                    operator: In
+                    values:
+                      - "true"
       containers:
         - name: worker
           image: ghcr.io/wavey-ai/encodec-api-worker:main

@@ -1,4 +1,4 @@
-name: Deploy Encodec API to EKS
+name: Deploy Encodec API
 
 on:
   push:
@@ -9,7 +9,6 @@ on:
 permissions:
   actions: read
   contents: read
-  id-token: write
   packages: read
 
 concurrency:
@@ -17,9 +16,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  ENCODEC_API_NAMESPACE: ${{ vars.ENCODEC_API_NAMESPACE || 'encodec-api' }}
-  ENCODEC_API_DOMAIN: ${{ vars.ENCODEC_API_DOMAIN || 'encodec.wavey.ai' }}
+  ENCODEC_API_CLUSTER_LABEL: wavey
+  ENCODEC_API_NAMESPACE: encodec-api
+  ENCODEC_API_DOMAIN: encodec.wavey.ai
   ENCODEC_API_INGRESS_IMAGE_REPO: ghcr.io/wavey-ai/encodec-api-ingress
   ENCODEC_API_WORKER_IMAGE_REPO: ghcr.io/wavey-ai/encodec-api-worker
   ENCODEC_API_KUSTOMIZE_PATH: deploy/k8s/encodec-api
@@ -40,11 +39,10 @@ jobs:
           set -euo pipefail
           git config --global url."https://x-access-token:${{ secrets.WAVEY_AI_GH_TOKEN }}@github.com/".insteadOf https://github.com/
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          python-version: "3.12"
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
@@ -53,7 +51,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo metadata --locked --no-deps >/dev/null
-          bash -n deploy/eks/manual-deploy.sh
+          python3 -m py_compile deploy/linode_api.py
+          bash -n deploy/lke/manual-deploy.sh
           kubectl kustomize "$ENCODEC_API_KUSTOMIZE_PATH" >/dev/null
 
       - name: Detect image changes
@@ -141,16 +140,43 @@ jobs:
           sys.exit(1)
           PY
 
-      - name: Deploy encodec-api to EKS
+      - name: Resolve LKE cluster
+        id: cluster
         env:
-          EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 deploy/linode_api.py cluster-id \
+            --label "$ENCODEC_API_CLUSTER_LABEL" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Fetch cluster kubeconfig
+        id: kubeconfig
+        env:
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
+        run: |
+          set -euo pipefail
+          kubeconfig_path="$RUNNER_TEMP/wavey-kubeconfig.yaml"
+          python3 deploy/linode_api.py cluster-kubeconfig \
+            --cluster-id "${{ steps.cluster.outputs.cluster_id }}" \
+            --output "$kubeconfig_path" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Deploy encodec-api to LKE
+        env:
+          KUBECONFIG: ${{ steps.kubeconfig.outputs.kubeconfig }}
+          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
           REGISTRY_SERVER: ${{ env.ENCODEC_API_REGISTRY }}
-          REGISTRY_USERNAME: ${{ vars.ENCODEC_API_REGISTRY_USERNAME || 'jbrough' }}
+          REGISTRY_USERNAME: jbrough
           REGISTRY_PASSWORD: ${{ secrets.WAVEY_AI_GH_TOKEN }}
           ENCODEC_API_INGRESS_REPLICAS: ${{ vars.ENCODEC_API_INGRESS_REPLICAS || '1' }}
           ENCODEC_API_WORKER_REPLICAS: ${{ vars.ENCODEC_API_WORKER_REPLICAS || '1' }}
         run: |
           set -euo pipefail
+
+          kubectl label nodes -l node.kubernetes.io/instance-type=g2-gpu-rtx4000a1-s \
+            nvidia.com/gpu.present=true \
+            --overwrite || true
 
           ingress_image="${ENCODEC_API_INGRESS_IMAGE_REPO}:main"
           worker_image="${ENCODEC_API_WORKER_IMAGE_REPO}:main"
@@ -160,6 +186,25 @@ jobs:
             worker_image="${ENCODEC_API_WORKER_IMAGE_REPO}:sha-${short_sha}"
           fi
 
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          wait_for_image() {
+            local image="$1"
+            local attempts="${2:-60}"
+            local delay_seconds="${3:-10}"
+            for _ in $(seq 1 "$attempts"); do
+              if docker manifest inspect "$image" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep "$delay_seconds"
+            done
+            echo "Timed out waiting for image $image" >&2
+            return 1
+          }
+
+          wait_for_image "$ingress_image"
+          wait_for_image "$worker_image"
+
           ENCODEC_API_INGRESS_IMAGE="$ingress_image" \
           ENCODEC_API_WORKER_IMAGE="$worker_image" \
-          bash deploy/eks/manual-deploy.sh
+          bash deploy/lke/manual-deploy.sh

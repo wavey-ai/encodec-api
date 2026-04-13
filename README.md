@@ -8,7 +8,7 @@ Current scope:
 - CPU ingress deployment plus GPU worker deployment
 - remote workers over `upload-response` with split ingress/worker scaling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
-- EKS deploy workflow and manifests for `encodec.wavey.ai`
+- Linode LKE deploy workflow and manifests for `encodec.wavey.ai`
 
 Target architecture:
 
@@ -21,7 +21,8 @@ Target architecture:
 
 Notes:
 
-- `encodec.wavey.ai` DNS is managed outside AWS. The repo only handles image build and Kubernetes deploy; DNS/TLS stays in your Linode/Cloudflare setup.
+- `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster.
+- The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
 - The worker runtime only needs `encodec` plus CUDA-capable PyTorch. Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
 
 ## GitHub secrets and variables
@@ -29,27 +30,25 @@ Notes:
 Secrets:
 
 - `WAVEY_AI_GH_TOKEN`: classic PAT with package access for private dependency fetches and GHCR pulls
-- `AWS_ROLE_TO_ASSUME`: IAM role assumed by GitHub Actions for EKS deploys
+- `LINODE_TOKEN`: token that can read the shared LKE cluster and update Linode DNS
 
 Variables:
 
-- `AWS_REGION`: default `us-east-1`
-- `EKS_CLUSTER_NAME`: target EKS cluster name
-- `ENCODEC_API_NAMESPACE`: default `encodec-api`
-- `ENCODEC_API_DOMAIN`: default `encodec.wavey.ai`
-- `ENCODEC_API_REGISTRY_USERNAME`: default `jbrough`
 - `ENCODEC_API_INGRESS_REPLICAS`: default `1`
 - `ENCODEC_API_WORKER_REPLICAS`: default `1`
+- `ENCODEC_API_NAMESPACE`: default `encodec-api`
+- `ENCODEC_API_DOMAIN`: default `encodec.wavey.ai`
 
 ## Workflows
 
 - `.github/workflows/build-image.yml`
-- `.github/workflows/deploy-eks.yml`
+- `.github/workflows/deploy-main.yml`
 
 ## Deploy layout
 
 - manifests: `deploy/k8s/encodec-api/`
-- helper script: `deploy/eks/manual-deploy.sh`
+- Linode helper: `deploy/linode_api.py`
+- helper script: `deploy/lke/manual-deploy.sh`
 
 ## Local run
 

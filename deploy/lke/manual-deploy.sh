@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${AWS_REGION:?set AWS_REGION}"
-: "${EKS_CLUSTER_NAME:?set EKS_CLUSTER_NAME}"
+: "${KUBECONFIG:?set KUBECONFIG to the target cluster kubeconfig}"
+: "${LINODE_TOKEN:?set LINODE_TOKEN for Linode DNS updates}"
 : "${REGISTRY_SERVER:=ghcr.io}"
 : "${REGISTRY_USERNAME:=jbrough}"
-: "${REGISTRY_PASSWORD:?set REGISTRY_PASSWORD}"
+: "${REGISTRY_PASSWORD:?set REGISTRY_PASSWORD for private image pulls}"
 
 ENCODEC_API_NAMESPACE="${ENCODEC_API_NAMESPACE:-encodec-api}"
 ENCODEC_API_DOMAIN="${ENCODEC_API_DOMAIN:-encodec.wavey.ai}"
@@ -20,18 +20,6 @@ cleanup() {
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT
-
-aws eks update-kubeconfig \
-  --region "$AWS_REGION" \
-  --name "$EKS_CLUSTER_NAME"
-
-kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
-
-kubectl -n "$ENCODEC_API_NAMESPACE" create secret docker-registry ghcr \
-  --docker-server="$REGISTRY_SERVER" \
-  --docker-username="$REGISTRY_USERNAME" \
-  --docker-password="$REGISTRY_PASSWORD" \
-  --dry-run=client -o yaml | kubectl apply -f -
 
 openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
   -keyout "$tmpdir/encodec-api.key" \
@@ -48,6 +36,15 @@ openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
   -subj "/CN=${ENCODEC_API_DOMAIN}" \
   -addext "subjectAltName=DNS:${ENCODEC_API_DOMAIN}" \
   >/dev/null 2>&1
+
+kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
+kubectl -n "$ENCODEC_API_NAMESPACE" delete pod -l wavey.ai/image-loader=true --ignore-not-found=true --wait=true || true
+
+kubectl -n "$ENCODEC_API_NAMESPACE" create secret docker-registry ghcr-wavey-ai \
+  --docker-server="$REGISTRY_SERVER" \
+  --docker-username="$REGISTRY_USERNAME" \
+  --docker-password="$REGISTRY_PASSWORD" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl -n "$ENCODEC_API_NAMESPACE" create secret tls encodec-api-tls \
   --cert="$tmpdir/encodec-api.crt" \
@@ -68,6 +65,29 @@ kubectl -n "$ENCODEC_API_NAMESPACE" rollout restart deployment/encodec-api-ingre
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout restart deployment/encodec-api-worker
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout status deployment/encodec-api-ingress --timeout=20m
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout status deployment/encodec-api-worker --timeout=30m
-kubectl -n "$ENCODEC_API_NAMESPACE" get deploy,pods,svc,ingress
 
-echo "encodec-api deployed for ${ENCODEC_API_DOMAIN}"
+ingress_ip=""
+for _ in $(seq 1 60); do
+  ingress_ip="$(kubectl -n "$ENCODEC_API_NAMESPACE" get ingress encodec-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  if [[ -z "$ingress_ip" ]]; then
+    ingress_ip="$(kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  fi
+  if [[ -n "$ingress_ip" ]]; then
+    break
+  fi
+  sleep 5
+done
+
+if [[ -z "$ingress_ip" ]]; then
+  echo "failed to resolve ingress IP" >&2
+  exit 1
+fi
+
+python3 deploy/linode_api.py upsert-domain-a-record \
+  --domain wavey.ai \
+  --name encodec \
+  --target "$ingress_ip" \
+  --ttl-sec 30
+
+kubectl -n "$ENCODEC_API_NAMESPACE" get deploy,pods,svc,ingress
+echo "encodec-api deployed to ${ENCODEC_API_DOMAIN} (${ingress_ip})"
