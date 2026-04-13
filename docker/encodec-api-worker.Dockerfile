@@ -15,10 +15,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 RUN --mount=type=secret,id=github_token \
-    set -euo pipefail; \
-    token="$(cat /run/secrets/github_token)"; \
-    git config --global url."https://x-access-token:${token}@github.com/".insteadOf https://github.com/; \
-    cargo build --release --locked
+    /bin/bash -lc 'set -euo pipefail; \
+    if [ -s /run/secrets/github_token ]; then \
+      token="$(cat /run/secrets/github_token)"; \
+      git config --global url."https://x-access-token:${token}@github.com/".insteadOf https://github.com/; \
+    fi; \
+    cargo build --release --locked'
 
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
