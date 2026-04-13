@@ -30,6 +30,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     clang \
+    cmake \
     git \
     libclang-dev \
     pkg-config \
