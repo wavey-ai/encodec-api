@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENCODEC_API_CLUSTER_LABEL: wavey
+  ENCODEC_API_CLUSTER_LABEL: wavey-us-ord
   ENCODEC_API_NAMESPACE: encodec-api
   ENCODEC_API_DOMAIN: encodec.wavey.ai
   ENCODEC_API_INGRESS_IMAGE_REPO: ghcr.io/wavey-ai/encodec-api-ingress
