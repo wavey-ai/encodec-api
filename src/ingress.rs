@@ -2,26 +2,26 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Request, StatusCode};
+use http::{header::CONTENT_TYPE, Request, StatusCode};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout, Duration};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 use upload_response::{
-    response_content_type, CachedIngress, IngressProxyConfig, RequestControl, TailSlot,
-    UploadResponseService,
+    response_content_type, CachedIngress, IngressProxyConfig, TailSlot, UploadResponseService,
 };
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, ServerError, StreamWriter, WebSocketHandler,
 };
 
 use crate::config::AppConfig;
-use crate::encode::client_error;
-use crate::protocol::{INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL};
+use crate::encode::{
+    apply_prepared_request_headers, client_error, parse_request, prepare_request_program,
+    PreparedEncodeProgram,
+};
 
 #[derive(Clone)]
 pub struct EncodeIngress {
@@ -70,6 +70,10 @@ impl EncodeIngress {
         stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
         reject_json_requests(&req).map_err(anyhow_to_server_error)?;
+        let prepared = self
+            .prepare_request_body(&req, body)
+            .await
+            .map_err(anyhow_to_server_error)?;
 
         let guard = self
             .cached
@@ -78,16 +82,11 @@ impl EncodeIngress {
             .map_err(anyhow_to_server_error)?;
         let stream_id = guard.stream_id();
 
-        self.write_cached_request_headers(stream_id, &req, true)
+        self.cache_prepared_request(stream_id, &req, &prepared, true)
             .await
             .map_err(anyhow_to_server_error)?;
 
-        let body_task = spawn_request_body_task(self.cached.clone(), stream_id, body);
-        let proxy_result = self
-            .cached
-            .proxy_streaming_response(stream_id, stream_writer)
-            .await;
-        let _ = body_task.await;
+        let proxy_result = self.cached.proxy_streaming_response(stream_id, stream_writer).await;
         guard.close().await;
         proxy_result
     }
@@ -97,6 +96,41 @@ impl EncodeIngress {
         req: Request<()>,
         stream: WebSocketStream<TokioIo<Upgraded>>,
     ) -> HandlerResult<()> {
+        reject_json_requests(&req).map_err(anyhow_to_server_error)?;
+        let (sink, mut source) = stream.split();
+        let mut body = Vec::new();
+
+        while let Some(frame) = source.next().await {
+            match frame {
+                Ok(Message::Binary(bytes)) => body.extend_from_slice(&bytes),
+                Ok(Message::Text(text)) => {
+                    let event =
+                        serde_json::from_str::<WsClientEvent>(&text).unwrap_or(WsClientEvent {
+                            event_type: String::new(),
+                        });
+                    match event.event_type.as_str() {
+                        "KeepAlive" => {}
+                        "Finalize" | "CloseStream" => break,
+                        _ => {}
+                    }
+                }
+                Ok(Message::Ping(_)) => {}
+                Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_)) => break,
+                Ok(Message::Frame(_)) => {}
+                Err(error) => {
+                    return Err(ServerError::Config(format!(
+                        "websocket receive failed: {error}"
+                    )));
+                }
+            }
+        }
+
+        let prepared = self
+            .prepare_request_bytes(&req, Bytes::from(body))
+            .await
+            .map_err(anyhow_to_server_error)?;
+
         let upload_stream = self
             .cached
             .open_streaming_request()
@@ -104,80 +138,12 @@ impl EncodeIngress {
             .map_err(anyhow_to_server_error)?;
         let stream_id = upload_stream.stream_id();
 
-        self.write_cached_request_headers(stream_id, &req, true)
+        self.cache_prepared_request(stream_id, &req, &prepared, true)
             .await
             .map_err(anyhow_to_server_error)?;
-
-        let (sink, mut source) = stream.split();
-        let response_task = tokio::spawn(self.clone().proxy_websocket_response(stream_id, sink));
-        let mut request_ended = false;
-
-        while let Some(frame) = source.next().await {
-            match frame {
-                Ok(Message::Binary(bytes)) => {
-                    if let Err(error) = self.cached.append_request_body(stream_id, bytes).await {
-                        let error = anyhow::anyhow!("failed to cache websocket upload: {error}");
-                        self.write_stream_error_response(stream_id, &error).await;
-                        let _ = self.cached.end_request(stream_id).await;
-                        request_ended = true;
-                        break;
-                    }
-                }
-                Ok(Message::Text(text)) => {
-                    let event =
-                        serde_json::from_str::<WsClientEvent>(&text).unwrap_or(WsClientEvent {
-                            event_type: String::new(),
-                        });
-                    match event.event_type.as_str() {
-                        "KeepAlive" => {
-                            let _ = self
-                                .cached
-                                .append_request_control(stream_id, RequestControl::KeepAlive)
-                                .await;
-                        }
-                        "Finalize" => {
-                            let _ = self
-                                .cached
-                                .append_request_control(stream_id, RequestControl::Finalize)
-                                .await;
-                        }
-                        "CloseStream" => {
-                            if !request_ended {
-                                let _ = self.cached.end_request(stream_id).await;
-                                request_ended = true;
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Message::Ping(_)) => {}
-                Ok(Message::Pong(_)) => {}
-                Ok(Message::Close(_)) => {
-                    if !request_ended {
-                        let _ = self.cached.end_request(stream_id).await;
-                        request_ended = true;
-                    }
-                    break;
-                }
-                Ok(Message::Frame(_)) => {}
-                Err(error) => {
-                    let error = anyhow::anyhow!("websocket receive failed: {error}");
-                    self.write_stream_error_response(stream_id, &error).await;
-                    let _ = self.cached.end_request(stream_id).await;
-                    request_ended = true;
-                    break;
-                }
-            }
-        }
-
-        if !request_ended {
-            let _ = self.cached.end_request(stream_id).await;
-        }
-
-        let _ = response_task.await;
+        let proxy_result = self.proxy_websocket_response(stream_id, sink).await;
         upload_stream.close().await;
-        Ok(())
+        proxy_result
     }
 
     async fn handle_encode_inner(
@@ -186,15 +152,14 @@ impl EncodeIngress {
         body: BodyStream,
     ) -> Result<HandlerResponse> {
         reject_json_requests(&req)?;
+        let prepared = self.prepare_request_body(&req, body).await?;
 
         let mut guard = self.cached.open_buffered_request().await?;
         let stream_id = guard.stream_id();
 
         let result = async {
-            self.write_cached_request_headers(stream_id, &req, false)
+            self.cache_prepared_request(stream_id, &req, &prepared, false)
                 .await?;
-            self.cached.copy_request_body(stream_id, body).await?;
-            self.cached.end_request(stream_id).await?;
 
             let rx = guard
                 .take_response_receiver()
@@ -211,23 +176,55 @@ impl EncodeIngress {
         &self,
         stream_id: u64,
         req: &Request<()>,
+        prepared: &PreparedEncodeProgram,
         streaming: bool,
     ) -> Result<()> {
         self.cached
             .write_request_headers_with(stream_id, req, |headers| {
-                if streaming {
-                    headers.insert(
-                        HeaderName::from_static(INTERNAL_STREAMING_MODE_HEADER),
-                        HeaderValue::from_static(INTERNAL_STREAMING_MODE_JSONL),
-                    );
-                }
-                Ok(())
+                apply_prepared_request_headers(headers, prepared, streaming)
             })
             .await
     }
 
+    async fn cache_prepared_request(
+        &self,
+        stream_id: u64,
+        req: &Request<()>,
+        prepared: &PreparedEncodeProgram,
+        streaming: bool,
+    ) -> Result<()> {
+        self.write_cached_request_headers(stream_id, req, prepared, streaming)
+            .await?;
+        self.cached
+            .append_request_body_sliced(
+                stream_id,
+                &prepared.pcm_bytes,
+                self.config.upload_response_config().slot_bytes().max(1),
+            )
+            .await?;
+        self.cached.end_request(stream_id).await
+    }
+
+    async fn prepare_request_body(
+        &self,
+        req: &Request<()>,
+        body: BodyStream,
+    ) -> Result<PreparedEncodeProgram> {
+        let body = collect_body(body).await?;
+        self.prepare_request_bytes(req, body).await
+    }
+
+    async fn prepare_request_bytes(
+        &self,
+        req: &Request<()>,
+        body: Bytes,
+    ) -> Result<PreparedEncodeProgram> {
+        let parsed = parse_request(req, body).await?;
+        prepare_request_program(parsed)
+    }
+
     async fn proxy_websocket_response(
-        self,
+        &self,
         stream_id: u64,
         mut sink: SplitSink<WebSocketStream<TokioIo<Upgraded>>, Message>,
     ) -> HandlerResult<()> {
@@ -308,14 +305,6 @@ impl EncodeIngress {
         .map_err(|_| ServerError::Config("response timeout".into()))?
     }
 
-    async fn write_stream_error_response(&self, stream_id: u64, error: &anyhow::Error) {
-        self.cached
-            .write_handler_response(
-                stream_id,
-                error_response(classify_error(error), error.to_string()),
-            )
-            .await;
-    }
 }
 
 impl EncodeIngressWebSocketHandler {
@@ -337,32 +326,6 @@ impl WebSocketHandler for EncodeIngressWebSocketHandler {
     fn can_handle(&self, path: &str) -> bool {
         path == "/encode/stream"
     }
-}
-
-fn spawn_request_body_task(
-    cached: CachedIngress,
-    stream_id: u64,
-    body: BodyStream,
-) -> JoinHandle<Result<()>> {
-    tokio::spawn(async move {
-        let result: Result<()> = async {
-            cached.copy_request_body(stream_id, body).await?;
-            cached.end_request(stream_id).await?;
-            Ok(())
-        }
-        .await;
-
-        if let Err(error) = &result {
-            cached
-                .write_handler_response(
-                    stream_id,
-                    error_response(classify_error(error), error.to_string()),
-                )
-                .await;
-        }
-
-        result
-    })
 }
 
 async fn send_ws_body_chunk(
@@ -428,4 +391,16 @@ fn classify_error(error: &anyhow::Error) -> StatusCode {
 
 fn anyhow_to_server_error(error: anyhow::Error) -> ServerError {
     ServerError::Config(error.to_string())
+}
+
+async fn collect_body(mut body: BodyStream) -> Result<Bytes> {
+    let mut buffer = Vec::new();
+    while let Some(next) = body.next().await {
+        let chunk = next.map_err(|error| anyhow::anyhow!("failed to read request body: {error}"))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buffer))
 }

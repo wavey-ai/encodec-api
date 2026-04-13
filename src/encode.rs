@@ -1,20 +1,30 @@
 use anyhow::{Context, Result};
+use av_api::cached_audio::{
+    apply_cached_pcm_descriptor_headers, cached_pcm_descriptor_from_headers, CachedPcmDescriptor,
+    CachedPcmFormat, PCM_FORMAT_HEADER,
+};
+use av_api::program_audio::{pcm_bytes_to_wav, prepare_audio_program, UploadedAudioFile};
 use async_trait::async_trait;
 use bytes::Bytes;
 use encodec_rs::{Encodec, EncodecOptions};
 use futures_util::stream;
-use hound::WavReader;
-use http::{header::CONTENT_TYPE, Request};
+use http::{
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    HeaderMap, HeaderValue, Request,
+};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
 use multer::Multipart;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use tempfile::TempDir;
-use tokio::process::Command;
+use std::path::Path;
 
 use crate::config::AppConfig;
+use crate::protocol::{
+    INTERNAL_AUDIO_KEY_HEADER, INTERNAL_DURATION_SECONDS_HEADER, INTERNAL_GAP_SECONDS_HEADER,
+    INTERNAL_QUALITY_HEADER, INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL,
+    INTERNAL_TOTAL_GAP_SECONDS_HEADER, INTERNAL_TRACK_COUNT_HEADER,
+};
 
 pub const DEFAULT_TRACK_GAP_SECONDS: f64 = 1.5;
 pub const PNG_FORMAT: &str = "rgb-v2";
@@ -93,6 +103,20 @@ pub struct EncodeArtifacts {
     pub total_gap_seconds: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedEncodeProgram {
+    pub pcm_bytes: Vec<u8>,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bits_per_sample: u8,
+    pub duration_seconds: f64,
+    pub quality: EncodeQuality,
+    pub audio_key: String,
+    pub track_count: usize,
+    pub gap_seconds: f64,
+    pub total_gap_seconds: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamArtifactSelection {
     Png,
@@ -146,7 +170,8 @@ pub async fn process_request(
     progress: &mut Option<&mut (dyn ProgressSink + Send)>,
 ) -> Result<EncodeArtifacts> {
     let parsed = parse_request(req, body).await?;
-    process_parsed_request(config, parsed, progress).await
+    let prepared = prepare_request_program(parsed)?;
+    process_prepared_program(config, prepared, progress).await
 }
 
 pub async fn process_parsed_request(
@@ -154,19 +179,21 @@ pub async fn process_parsed_request(
     parsed: ParsedEncodeRequest,
     progress: &mut Option<&mut (dyn ProgressSink + Send)>,
 ) -> Result<EncodeArtifacts> {
-    emit_progress(
-        progress,
-        json!({ "type": "Progress", "status": "loading", "msg": "Reading audio..." }),
-    )
-    .await?;
+    let prepared = prepare_request_program(parsed)?;
+    process_prepared_program(config, prepared, progress).await
+}
 
-    let prepared = assemble_program_audio(config, &parsed.files, parsed.gap_seconds).await?;
+pub async fn process_prepared_program(
+    config: &AppConfig,
+    prepared: PreparedEncodeProgram,
+    progress: &mut Option<&mut (dyn ProgressSink + Send)>,
+) -> Result<EncodeArtifacts> {
     emit_progress(
         progress,
         json!({
             "type": "Progress",
             "status": "loading",
-            "msg": "Preparing 48kHz stereo...",
+            "msg": "Prepared canonical stereo PCM",
             "duration": round_one(prepared.duration_seconds),
         }),
     )
@@ -179,12 +206,24 @@ pub async fn process_parsed_request(
             "status": "encoding",
             "msg": "Encoding with EnCodec...",
             "duration": round_one(prepared.duration_seconds),
-            "bandwidthKbps": parsed.quality.bandwidth_kbps(),
+            "bandwidthKbps": prepared.quality.bandwidth_kbps(),
         }),
     )
     .await?;
 
-    let ecdc = run_encodec(config, &prepared.program_wav, parsed.quality).await?;
+    let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
+    let program_wav = tempdir.path().join("program.wav");
+    let wav_bytes = pcm_bytes_to_wav(
+        &prepared.pcm_bytes,
+        prepared.sample_rate,
+        prepared.channels,
+        prepared.bits_per_sample,
+    )?;
+    tokio::fs::write(&program_wav, wav_bytes)
+        .await
+        .with_context(|| format!("failed to write {}", program_wav.display()))?;
+
+    let ecdc = run_encodec(config, &program_wav, prepared.quality).await?;
 
     emit_progress(
         progress,
@@ -198,14 +237,120 @@ pub async fn process_parsed_request(
         png,
         png_side,
         duration_seconds: prepared.duration_seconds,
-        quality: parsed.quality,
-        audio_key: parsed.audio_key,
-        track_count: parsed.files.len(),
-        gap_seconds: parsed.gap_seconds,
+        quality: prepared.quality,
+        audio_key: prepared.audio_key,
+        track_count: prepared.track_count,
+        gap_seconds: prepared.gap_seconds,
         total_gap_seconds: prepared.total_gap_seconds,
     };
 
     Ok(artifacts)
+}
+
+pub fn apply_prepared_request_headers(
+    headers: &mut HeaderMap,
+    prepared: &PreparedEncodeProgram,
+    streaming: bool,
+) -> Result<()> {
+    headers.remove(CONTENT_LENGTH);
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+
+    apply_cached_pcm_descriptor_headers(
+        headers,
+        CachedPcmDescriptor::new(
+            CachedPcmFormat::S16LeInterleaved,
+            prepared.sample_rate,
+            prepared.channels,
+            prepared.bits_per_sample,
+        ),
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    insert_header(
+        headers,
+        INTERNAL_QUALITY_HEADER,
+        prepared.quality.as_str().to_string(),
+    )?;
+    insert_header(
+        headers,
+        INTERNAL_TRACK_COUNT_HEADER,
+        prepared.track_count.to_string(),
+    )?;
+    insert_header(
+        headers,
+        INTERNAL_GAP_SECONDS_HEADER,
+        prepared.gap_seconds.to_string(),
+    )?;
+    insert_header(
+        headers,
+        INTERNAL_TOTAL_GAP_SECONDS_HEADER,
+        prepared.total_gap_seconds.to_string(),
+    )?;
+    insert_header(
+        headers,
+        INTERNAL_DURATION_SECONDS_HEADER,
+        prepared.duration_seconds.to_string(),
+    )?;
+    insert_header(
+        headers,
+        INTERNAL_AUDIO_KEY_HEADER,
+        prepared.audio_key.clone(),
+    )?;
+
+    if streaming {
+        headers.insert(
+            INTERNAL_STREAMING_MODE_HEADER,
+            HeaderValue::from_static(INTERNAL_STREAMING_MODE_JSONL),
+        );
+    } else {
+        headers.remove(INTERNAL_STREAMING_MODE_HEADER);
+    }
+
+    Ok(())
+}
+
+pub fn prepared_program_from_internal_request(
+    request: &Request<()>,
+    body: &[u8],
+) -> Result<Option<PreparedEncodeProgram>> {
+    if !request.headers().contains_key(PCM_FORMAT_HEADER) {
+        return Ok(None);
+    }
+
+    let descriptor =
+        cached_pcm_descriptor_from_headers(request.headers()).map_err(anyhow::Error::msg)?;
+    let quality = EncodeQuality::parse(Some(required_header(
+        request.headers(),
+        INTERNAL_QUALITY_HEADER,
+    )?))?;
+    let track_count = parse_required_header::<usize>(request.headers(), INTERNAL_TRACK_COUNT_HEADER)?;
+    let gap_seconds = parse_required_header::<f64>(request.headers(), INTERNAL_GAP_SECONDS_HEADER)?;
+    let total_gap_seconds =
+        parse_required_header::<f64>(request.headers(), INTERNAL_TOTAL_GAP_SECONDS_HEADER)?;
+    let duration_seconds =
+        parse_required_header::<f64>(request.headers(), INTERNAL_DURATION_SECONDS_HEADER)?;
+    let audio_key = required_header(request.headers(), INTERNAL_AUDIO_KEY_HEADER)?.to_string();
+
+    anyhow::ensure!(
+        !body.is_empty(),
+        "prepared internal request body did not include PCM bytes"
+    );
+
+    Ok(Some(PreparedEncodeProgram {
+        pcm_bytes: body.to_vec(),
+        sample_rate: descriptor.sample_rate,
+        channels: descriptor.channels,
+        bits_per_sample: descriptor.bits_per_sample,
+        duration_seconds,
+        quality,
+        audio_key,
+        track_count,
+        gap_seconds,
+        total_gap_seconds,
+    }))
 }
 
 pub fn stream_artifact_selection(req: &Request<()>) -> Result<StreamArtifactSelection> {
@@ -358,167 +503,6 @@ pub fn headers_to_json(headers: &[(String, String)]) -> Value {
     Value::Object(map)
 }
 
-struct PreparedProgram {
-    _tempdir: TempDir,
-    program_wav: PathBuf,
-    duration_seconds: f64,
-    total_gap_seconds: f64,
-}
-
-async fn assemble_program_audio(
-    config: &AppConfig,
-    files: &[UploadedFile],
-    gap_seconds: f64,
-) -> Result<PreparedProgram> {
-    let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
-    let mut normalized = Vec::with_capacity(files.len());
-
-    for (index, file) in files.iter().enumerate() {
-        let input_path = tempdir.path().join(format!(
-            "input-{index}{}",
-            extension_for_filename(&file.filename)
-        ));
-        tokio::fs::write(&input_path, &file.bytes)
-            .await
-            .with_context(|| format!("failed to write {}", input_path.display()))?;
-
-        let output_path = tempdir.path().join(format!("normalized-{index}.wav"));
-        normalize_audio(&config.ffmpeg_bin, &input_path, &output_path).await?;
-        normalized.push(output_path);
-    }
-
-    let program_wav = tempdir.path().join("program.wav");
-    let total_gap_seconds = if files.len() > 1 {
-        gap_seconds.max(0.0) * (files.len() - 1) as f64
-    } else {
-        0.0
-    };
-
-    if normalized.len() == 1 {
-        tokio::fs::copy(&normalized[0], &program_wav)
-            .await
-            .with_context(|| {
-                format!("failed to copy {} to program wav", normalized[0].display())
-            })?;
-    } else {
-        let gap_wav = tempdir.path().join("gap.wav");
-        if gap_seconds > 0.0 {
-            generate_gap_audio(&config.ffmpeg_bin, &gap_wav, gap_seconds).await?;
-        }
-        let concat_list = tempdir.path().join("concat.txt");
-        let mut manifest = String::new();
-        for (index, path) in normalized.iter().enumerate() {
-            manifest.push_str("file '");
-            manifest.push_str(&escape_concat_path(path));
-            manifest.push_str("'\n");
-            if gap_seconds > 0.0 && index + 1 < normalized.len() {
-                manifest.push_str("file '");
-                manifest.push_str(&escape_concat_path(&gap_wav));
-                manifest.push_str("'\n");
-            }
-        }
-        tokio::fs::write(&concat_list, manifest)
-            .await
-            .with_context(|| format!("failed to write {}", concat_list.display()))?;
-        concat_audio(&config.ffmpeg_bin, &concat_list, &program_wav).await?;
-    }
-
-    let duration_seconds = wav_duration_seconds(&program_wav)?;
-    Ok(PreparedProgram {
-        _tempdir: tempdir,
-        program_wav,
-        duration_seconds,
-        total_gap_seconds,
-    })
-}
-
-async fn normalize_audio(ffmpeg_bin: &str, input: &Path, output: &Path) -> Result<()> {
-    run_command(
-        ffmpeg_bin,
-        &[
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            &input.display().to_string(),
-            "-vn",
-            "-ac",
-            "2",
-            "-ar",
-            "48000",
-            "-c:a",
-            "pcm_s16le",
-            &output.display().to_string(),
-        ],
-    )
-    .await
-}
-
-async fn generate_gap_audio(ffmpeg_bin: &str, output: &Path, gap_seconds: f64) -> Result<()> {
-    run_command(
-        ffmpeg_bin,
-        &[
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=r=48000:cl=stereo",
-            "-t",
-            &format!("{gap_seconds:.6}"),
-            "-c:a",
-            "pcm_s16le",
-            &output.display().to_string(),
-        ],
-    )
-    .await
-}
-
-async fn concat_audio(ffmpeg_bin: &str, manifest: &Path, output: &Path) -> Result<()> {
-    run_command(
-        ffmpeg_bin,
-        &[
-            "-y",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            &manifest.display().to_string(),
-            "-c",
-            "copy",
-            &output.display().to_string(),
-        ],
-    )
-    .await
-}
-
-async fn run_command(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("failed to launch {program}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(anyhow::anyhow!(
-        "{program} failed with status {}: {}",
-        output.status,
-        stderr.trim()
-    ))
-}
-
 async fn run_encodec(
     config: &AppConfig,
     input_wav: &Path,
@@ -576,13 +560,30 @@ fn png_side_for_bytes(size_bytes: usize) -> usize {
     (pixels as f64).sqrt().ceil() as usize
 }
 
-fn wav_duration_seconds(path: &Path) -> Result<f64> {
-    let reader =
-        WavReader::open(path).with_context(|| format!("failed to open wav {}", path.display()))?;
-    let spec = reader.spec();
-    let total_samples = reader.duration() as f64;
-    let channels = spec.channels.max(1) as f64;
-    Ok(total_samples / spec.sample_rate as f64 / channels)
+pub fn prepare_request_program(parsed: ParsedEncodeRequest) -> Result<PreparedEncodeProgram> {
+    let track_count = parsed.files.len();
+    let uploaded = parsed
+        .files
+        .into_iter()
+        .map(|file| UploadedAudioFile {
+            filename: file.filename,
+            bytes: file.bytes,
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_audio_program(&uploaded, parsed.gap_seconds)?;
+
+    Ok(PreparedEncodeProgram {
+        pcm_bytes: prepared.pcm_bytes,
+        sample_rate: prepared.sample_rate,
+        channels: prepared.channels,
+        bits_per_sample: prepared.bits_per_sample,
+        duration_seconds: prepared.duration_seconds,
+        quality: parsed.quality,
+        audio_key: parsed.audio_key,
+        track_count,
+        gap_seconds: parsed.gap_seconds,
+        total_gap_seconds: prepared.total_gap_seconds,
+    })
 }
 
 fn request_filename(req: &Request<()>) -> String {
@@ -622,14 +623,6 @@ fn parse_gap_seconds(value: &str) -> Result<f64> {
     Ok(parsed)
 }
 
-fn extension_for_filename(filename: &str) -> String {
-    Path::new(filename)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!(".{value}"))
-        .unwrap_or_else(|| ".bin".into())
-}
-
 fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
     let content_type = content_type.to_ascii_lowercase();
     match content_type.as_str() {
@@ -643,8 +636,30 @@ fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
     }
 }
 
-fn escape_concat_path(path: &Path) -> String {
-    path.display().to_string().replace('\'', "'\\''")
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: String) -> Result<()> {
+    headers.insert(
+        name,
+        HeaderValue::from_str(&value)
+            .map_err(|error| anyhow::anyhow!("invalid {name} header value: {error}"))?,
+    );
+    Ok(())
+}
+
+fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing header {name}"))
+}
+
+fn parse_required_header<T>(headers: &HeaderMap, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    required_header(headers, name)?
+        .parse::<T>()
+        .map_err(|error| anyhow::anyhow!("invalid {name} header: {error}"))
 }
 
 async fn emit_progress(
@@ -700,5 +715,37 @@ mod tests {
             stream_artifact_selection(&req).unwrap(),
             StreamArtifactSelection::Ecdc
         );
+    }
+
+    #[test]
+    fn prepared_internal_headers_roundtrip() {
+        let prepared = PreparedEncodeProgram {
+            pcm_bytes: vec![1, 2, 3, 4],
+            sample_rate: 48_000,
+            channels: 2,
+            bits_per_sample: 16,
+            duration_seconds: 12.5,
+            quality: EncodeQuality::Hq,
+            audio_key: "abc123".into(),
+            track_count: 3,
+            gap_seconds: 1.5,
+            total_gap_seconds: 3.0,
+        };
+
+        let mut request = Request::builder().uri("/encode/stream?artifact=both").body(()).unwrap();
+        apply_prepared_request_headers(request.headers_mut(), &prepared, true).unwrap();
+
+        let decoded =
+            prepared_program_from_internal_request(&request, &prepared.pcm_bytes).unwrap().unwrap();
+        assert_eq!(decoded.pcm_bytes, prepared.pcm_bytes);
+        assert_eq!(decoded.sample_rate, prepared.sample_rate);
+        assert_eq!(decoded.channels, prepared.channels);
+        assert_eq!(decoded.bits_per_sample, prepared.bits_per_sample);
+        assert_eq!(decoded.duration_seconds, prepared.duration_seconds);
+        assert_eq!(decoded.quality, prepared.quality);
+        assert_eq!(decoded.audio_key, prepared.audio_key);
+        assert_eq!(decoded.track_count, prepared.track_count);
+        assert_eq!(decoded.gap_seconds, prepared.gap_seconds);
+        assert_eq!(decoded.total_gap_seconds, prepared.total_gap_seconds);
     }
 }

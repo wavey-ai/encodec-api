@@ -18,7 +18,8 @@ use web_service::HandlerResponse;
 
 use crate::config::AppConfig;
 use crate::encode::{
-    headers_to_json, parse_request, process_parsed_request, process_request, response_headers,
+    headers_to_json, parse_request, prepared_program_from_internal_request,
+    process_parsed_request, process_prepared_program, process_request, response_headers,
     stream_artifact_selection, EncodeArtifacts, ProgressSink, StreamArtifactSelection,
 };
 use crate::protocol::{INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL};
@@ -240,7 +241,13 @@ impl WorkerState {
             .read_remote_request_body(client, origin, stream_id)
             .await?;
         let mut progress: Option<&mut (dyn ProgressSink + Send)> = None;
-        let artifacts = process_request(&self.config, &request, body, &mut progress).await?;
+        let artifacts = if let Some(prepared) =
+            prepared_program_from_internal_request(&request, &body)?
+        {
+            process_prepared_program(&self.config, prepared, &mut progress).await?
+        } else {
+            process_request(&self.config, &request, body, &mut progress).await?
+        };
         let headers = response_headers(&artifacts);
         let response = if request.uri().path() == "/encode/ecdc" {
             HandlerResponse {
@@ -295,21 +302,36 @@ impl WorkerState {
         let body = self
             .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
             .await?;
-        let parsed = parse_request(&request, body).await?;
-
-        writer
-            .send_value(json!({
-                "type": "Request",
-                "request_id": request_id.as_str(),
-                "track_count": parsed.files.len(),
-                "quality": parsed.quality.as_str(),
-                "gap_seconds": parsed.gap_seconds,
-                "audio_key": parsed.audio_key.as_str(),
-            }))
-            .await?;
-
-        let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
-        let artifacts = process_parsed_request(&self.config, parsed, &mut progress).await?;
+        let artifacts = if let Some(prepared) =
+            prepared_program_from_internal_request(&request, &body)?
+        {
+            writer
+                .send_value(json!({
+                    "type": "Request",
+                    "request_id": request_id.as_str(),
+                    "track_count": prepared.track_count,
+                    "quality": prepared.quality.as_str(),
+                    "gap_seconds": prepared.gap_seconds,
+                    "audio_key": prepared.audio_key.as_str(),
+                }))
+                .await?;
+            let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
+            process_prepared_program(&self.config, prepared, &mut progress).await?
+        } else {
+            let parsed = parse_request(&request, body).await?;
+            writer
+                .send_value(json!({
+                    "type": "Request",
+                    "request_id": request_id.as_str(),
+                    "track_count": parsed.files.len(),
+                    "quality": parsed.quality.as_str(),
+                    "gap_seconds": parsed.gap_seconds,
+                    "audio_key": parsed.audio_key.as_str(),
+                }))
+                .await?;
+            let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
+            process_parsed_request(&self.config, parsed, &mut progress).await?
+        };
         self.send_stream_artifacts(writer, &request_id, artifact_selection, &artifacts)
             .await?;
         writer

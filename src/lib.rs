@@ -88,7 +88,6 @@ pub async fn run(config: AppConfig) -> Result<()> {
         role = ?config.role,
         port = config.port,
         enable_h3 = config.enable_h3,
-        ffmpeg_bin = %config.ffmpeg_bin,
         encodec_bin = %config.encodec_bin,
         encodec_python = %config
             .encodec_python

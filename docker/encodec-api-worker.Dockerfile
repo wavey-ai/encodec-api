@@ -28,7 +28,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    ffmpeg \
     python3 \
     python3-venv \
   && rm -rf /var/lib/apt/lists/*
@@ -42,7 +41,6 @@ COPY --from=build /app/target/release/encodec-api /usr/local/bin/encodec-api
 
 ENV ENCODEC_API_ROLE=worker
 ENV ENCODEC_BIN=/opt/encodec-env/bin/encodec
-ENV FFMPEG_BIN=/usr/bin/ffmpeg
 ENV PORT=8443
 EXPOSE 8443
 

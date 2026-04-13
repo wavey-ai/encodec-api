@@ -47,9 +47,6 @@ pub struct AppConfig {
     #[arg(long, env = "TLS_KEY_PATH")]
     pub tls_key_path: Option<String>,
 
-    #[arg(long, env = "FFMPEG_BIN", default_value = "ffmpeg")]
-    pub ffmpeg_bin: String,
-
     #[arg(long, env = "ENCODEC_BIN", default_value = "encodec")]
     pub encodec_bin: String,
 
@@ -104,10 +101,6 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.port > 0, "PORT must be > 0");
-        anyhow::ensure!(
-            !self.ffmpeg_bin.trim().is_empty(),
-            "FFMPEG_BIN must not be empty"
-        );
         anyhow::ensure!(
             !self.encodec_bin.trim().is_empty(),
             "ENCODEC_BIN must not be empty"

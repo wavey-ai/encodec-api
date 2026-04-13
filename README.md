@@ -6,13 +6,14 @@ Current scope:
 
 - split-role service on the Wavey `web-service` crate
 - CPU ingress deployment plus GPU worker deployment
-- remote workers over `upload-response`, the same internal pattern as `asr-api`
+- remote workers over `upload-response` with split ingress/worker scaling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
 - EKS deploy workflow and manifests for `encodec.wavey.ai`
 
 Target architecture:
 
 - ingress owns the public HTTPS surface and the `upload-response` cache
+- ingress normalizes uploaded media into canonical PCM through `av-api` + `soundkit`
 - workers poll ingress over the private `/_upload_response` plane
 - worker-side `encodec-rs` integration handles `/encode`, `/encode/ecdc`, and `/encode/stream`
 - `/encode/stream` returns NDJSON event frames over streamed HTTP and websocket transports
@@ -20,8 +21,8 @@ Target architecture:
 
 Notes:
 
-- `wavey.ai` DNS is not in Route53 in the AWS account currently configured on this machine, so `encodec.wavey.ai` still needs Cloudflare-side DNS/TLS wiring.
-- The current repo uses the canonical EnCodec CLI boundary through `encodec-rs`, so the worker image needs `ffmpeg`, `encodec`, and CUDA-capable PyTorch when running on GPU nodes.
+- `encodec.wavey.ai` DNS is managed outside AWS. The repo only handles image build and Kubernetes deploy; DNS/TLS stays in your Linode/Cloudflare setup.
+- The worker runtime only needs `encodec` plus CUDA-capable PyTorch. Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
 
 ## GitHub secrets and variables
 
@@ -53,7 +54,7 @@ Variables:
 ## Local run
 
 ```bash
-cargo run -- --port 8443 --encodec-bin "$(command -v encodec)" --ffmpeg-bin "$(command -v ffmpeg)"
+cargo run -- --port 8443 --encodec-bin "$(command -v encodec)"
 ```
 
 Health check:
