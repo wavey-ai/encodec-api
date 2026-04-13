@@ -53,6 +53,12 @@ pub struct AppConfig {
     #[arg(long, env = "ENCODEC_PYTHON")]
     pub encodec_python: Option<String>,
 
+    #[arg(long, env = "ENCODEC_BACKEND", default_value = "external-encodec")]
+    pub encodec_backend: String,
+
+    #[arg(long, env = "ENCODEC_EXECUTION_TARGET")]
+    pub encodec_execution_target: Option<String>,
+
     #[arg(long, env = "UPLOAD_RESPONSE_NUM_STREAMS", default_value_t = 2)]
     pub upload_response_num_streams: usize,
 
@@ -104,6 +110,10 @@ impl AppConfig {
         anyhow::ensure!(
             !self.encodec_bin.trim().is_empty(),
             "ENCODEC_BIN must not be empty"
+        );
+        anyhow::ensure!(
+            !self.encodec_backend.trim().is_empty(),
+            "ENCODEC_BACKEND must not be empty"
         );
         anyhow::ensure!(
             self.upload_response_num_streams > 0,
@@ -179,5 +189,26 @@ impl AppConfig {
             slots_per_stream: self.upload_response_slots_per_stream,
             response_timeout_ms: self.upload_response_timeout_ms,
         }
+    }
+
+    pub fn encodec_backend_label(&self) -> &str {
+        self.encodec_backend.as_str()
+    }
+
+    pub fn execution_target_label(&self) -> &str {
+        self.encodec_execution_target
+            .as_deref()
+            .unwrap_or_else(|| match self.role {
+                AppRole::Ingress => "cpu",
+                AppRole::Worker => "gpu",
+            })
+    }
+
+    pub fn device_label(&self) -> String {
+        format!(
+            "{}-{}",
+            self.execution_target_label(),
+            self.encodec_backend_label()
+        )
     }
 }

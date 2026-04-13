@@ -39,6 +39,9 @@ openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
 
 kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
 kubectl -n "$ENCODEC_API_NAMESPACE" delete pod -l wavey.ai/image-loader=true --ignore-not-found=true --wait=true || true
+kubectl label nodes -l node.kubernetes.io/instance-type=g2-gpu-rtx4000a1-s \
+  nvidia.com/gpu.present=true \
+  --overwrite || true
 
 kubectl -n "$ENCODEC_API_NAMESPACE" create secret docker-registry ghcr-wavey-ai \
   --docker-server="$REGISTRY_SERVER" \

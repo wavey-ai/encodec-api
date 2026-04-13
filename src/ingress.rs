@@ -86,7 +86,10 @@ impl EncodeIngress {
             .await
             .map_err(anyhow_to_server_error)?;
 
-        let proxy_result = self.cached.proxy_streaming_response(stream_id, stream_writer).await;
+        let proxy_result = self
+            .cached
+            .proxy_streaming_response(stream_id, stream_writer)
+            .await;
         guard.close().await;
         proxy_result
     }
@@ -304,7 +307,6 @@ impl EncodeIngress {
         .await
         .map_err(|_| ServerError::Config("response timeout".into()))?
     }
-
 }
 
 impl EncodeIngressWebSocketHandler {
@@ -396,7 +398,8 @@ fn anyhow_to_server_error(error: anyhow::Error) -> ServerError {
 async fn collect_body(mut body: BodyStream) -> Result<Bytes> {
     let mut buffer = Vec::new();
     while let Some(next) = body.next().await {
-        let chunk = next.map_err(|error| anyhow::anyhow!("failed to read request body: {error}"))?;
+        let chunk =
+            next.map_err(|error| anyhow::anyhow!("failed to read request body: {error}"))?;
         if chunk.is_empty() {
             continue;
         }

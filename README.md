@@ -5,7 +5,7 @@
 Current scope:
 
 - split-role service on the Wavey `web-service` crate
-- CPU ingress deployment plus CPU worker deployment
+- CPU ingress deployment plus GPU worker deployment
 - remote workers over `upload-response` with split ingress/worker scaling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
 - Linode LKE deploy workflow and manifests for `encodec.wavey.ai`
@@ -15,7 +15,7 @@ Target architecture:
 - ingress owns the public HTTPS surface and the `upload-response` cache
 - ingress normalizes uploaded media into canonical PCM through `av-api` + `soundkit`
 - workers poll ingress over the private `/_upload_response` plane
-- worker-side `encodec-rs` integration handles `/encode`, `/encode/ecdc`, and `/encode/stream`
+- worker-side EnCodec execution handles `/encode`, `/encode/ecdc`, and `/encode/stream`
 - `/encode/stream` returns NDJSON event frames over streamed HTTP and websocket transports
 - worker scaling is via deployment replicas plus `UPLOAD_RESPONSE_MAX_INFLIGHT`
 
@@ -23,7 +23,9 @@ Notes:
 
 - `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster labeled `wavey-us-ord`.
 - The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
-- The worker runtime uses the Wavey `encodec` fork plus PyTorch and a minimal WAV backend (`soundfile`/`libsndfile`). Media decode and canonical PCM preparation happen on ingress through `av-api` and `soundkit`.
+- Ingress is CPU-only and is responsible for upload parsing, media decode, and canonical PCM preparation through `av-api` + `soundkit`.
+- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run the Wavey `encodec` fork through the external `encodec` runtime today.
+- `encodec-rs` is already part of the repo boundary, but the worker does not yet use the ONNX path in production. The current production encode backend is still the external EnCodec runtime.
 
 ## GitHub secrets and variables
 

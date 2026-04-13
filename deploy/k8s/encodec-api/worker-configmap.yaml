@@ -7,7 +7,9 @@ data:
   ENCODEC_API_ROLE: worker
   PORT: "8443"
   ENABLE_H3: "false"
+  ENCODEC_BACKEND: external-encodec
   ENCODEC_BIN: /opt/encodec-env/bin/encodec
+  ENCODEC_EXECUTION_TARGET: gpu
   UPLOAD_RESPONSE_WORKER_ID: encodec-api-worker
   UPLOAD_RESPONSE_WORKER_POLL_MS: "10"
   UPLOAD_RESPONSE_MAX_INFLIGHT: "1"

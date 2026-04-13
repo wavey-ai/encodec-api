@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use av_api::cached_audio::{
     apply_cached_pcm_descriptor_headers, cached_pcm_descriptor_from_headers, CachedPcmDescriptor,
     CachedPcmFormat, PCM_FORMAT_HEADER,
 };
 use av_api::program_audio::{pcm_bytes_to_wav, prepare_audio_program, UploadedAudioFile};
-use async_trait::async_trait;
 use bytes::Bytes;
 use encodec_rs::{Encodec, EncodecOptions};
 use futures_util::stream;
@@ -95,6 +95,7 @@ pub struct EncodeArtifacts {
     pub ecdc: Bytes,
     pub png: Bytes,
     pub png_side: usize,
+    pub device_label: String,
     pub duration_seconds: f64,
     pub quality: EncodeQuality,
     pub audio_key: String,
@@ -236,6 +237,7 @@ pub async fn process_prepared_program(
         ecdc,
         png,
         png_side,
+        device_label: config.device_label(),
         duration_seconds: prepared.duration_seconds,
         quality: prepared.quality,
         audio_key: prepared.audio_key,
@@ -326,7 +328,8 @@ pub fn prepared_program_from_internal_request(
         request.headers(),
         INTERNAL_QUALITY_HEADER,
     )?))?;
-    let track_count = parse_required_header::<usize>(request.headers(), INTERNAL_TRACK_COUNT_HEADER)?;
+    let track_count =
+        parse_required_header::<usize>(request.headers(), INTERNAL_TRACK_COUNT_HEADER)?;
     let gap_seconds = parse_required_header::<f64>(request.headers(), INTERNAL_GAP_SECONDS_HEADER)?;
     let total_gap_seconds =
         parse_required_header::<f64>(request.headers(), INTERNAL_TOTAL_GAP_SECONDS_HEADER)?;
@@ -465,7 +468,7 @@ pub fn response_headers(artifacts: &EncodeArtifacts) -> Vec<(String, String)> {
             "x-duration".into(),
             round_two(artifacts.duration_seconds).to_string(),
         ),
-        ("x-device".into(), "external-encodec".into()),
+        ("x-device".into(), artifacts.device_label.clone()),
         ("x-png-format".into(), PNG_FORMAT.into()),
         ("x-encodec-model".into(), MODEL_NAME.into()),
         ("x-encodec-lm".into(), "true".into()),
@@ -732,11 +735,15 @@ mod tests {
             total_gap_seconds: 3.0,
         };
 
-        let mut request = Request::builder().uri("/encode/stream?artifact=both").body(()).unwrap();
+        let mut request = Request::builder()
+            .uri("/encode/stream?artifact=both")
+            .body(())
+            .unwrap();
         apply_prepared_request_headers(request.headers_mut(), &prepared, true).unwrap();
 
-        let decoded =
-            prepared_program_from_internal_request(&request, &prepared.pcm_bytes).unwrap().unwrap();
+        let decoded = prepared_program_from_internal_request(&request, &prepared.pcm_bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(decoded.pcm_bytes, prepared.pcm_bytes);
         assert_eq!(decoded.sample_rate, prepared.sample_rate);
         assert_eq!(decoded.channels, prepared.channels);

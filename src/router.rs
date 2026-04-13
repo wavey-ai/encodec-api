@@ -82,12 +82,16 @@ impl Router for AppRouter {
                 ))
             }
             (&Method::GET, "/status") => Ok(Self::json_response(format!(
-                "{{\"status\":\"ok\",\"service\":\"encodec-api\",\"role\":\"{:?}\"}}",
-                self.config.role
+                "{{\"status\":\"ok\",\"service\":\"encodec-api\",\"role\":\"{:?}\",\"backend\":\"{}\",\"execution_target\":\"{}\"}}",
+                self.config.role,
+                self.config.encodec_backend_label(),
+                self.config.execution_target_label()
             ))),
-            (&Method::GET, "/info") => Ok(Self::json_response(
-                "{\"service\":\"encodec-api\",\"paths\":[\"/encode\",\"/encode/ecdc\",\"/encode/stream\"],\"transport\":\"upload-response\",\"streaming\":\"ndjson\",\"scale\":\"split ingress/worker\"}".into(),
-            )),
+            (&Method::GET, "/info") => Ok(Self::json_response(format!(
+                "{{\"service\":\"encodec-api\",\"paths\":[\"/encode\",\"/encode/ecdc\",\"/encode/stream\"],\"transport\":\"upload-response\",\"streaming\":\"ndjson\",\"scale\":\"cpu-ingress/gpu-worker\",\"backend\":\"{}\",\"execution_target\":\"{}\"}}",
+                self.config.encodec_backend_label(),
+                self.config.execution_target_label()
+            ))),
             (&Method::GET, "/ha/live") | (&Method::HEAD, "/ha/live") => Ok(HandlerResponse {
                 status: StatusCode::OK,
                 body: (req.method() == Method::GET).then(|| Bytes::from("OK")),
