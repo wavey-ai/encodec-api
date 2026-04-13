@@ -3,6 +3,8 @@ kind: Service
 metadata:
   name: encodec-api-ingress
   namespace: encodec-api
+  annotations:
+    haproxy.org/server-ssl: "true"
 spec:
   type: ClusterIP
   selector:
@@ -17,6 +19,8 @@ kind: Service
 metadata:
   name: encodec-api-ingress-internal
   namespace: encodec-api
+  annotations:
+    haproxy.org/server-ssl: "true"
 spec:
   clusterIP: None
   selector:
