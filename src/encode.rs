@@ -1,12 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use av_api::cached_audio::{
     apply_cached_pcm_descriptor_headers, cached_pcm_descriptor_from_headers, CachedPcmDescriptor,
     CachedPcmFormat, PCM_FORMAT_HEADER,
 };
-use av_api::program_audio::{pcm_bytes_to_wav, prepare_audio_program, UploadedAudioFile};
+use av_api::program_audio::{prepare_audio_program, UploadedAudioFile};
 use bytes::Bytes;
-use encodec_rs::{Encodec, EncodecOptions};
+use encodec_rs::ecdc::encode_audio_to_ecdc_with_options;
+use encodec_rs::onnx::{ExecutionTarget, OnnxFrameCodec, OnnxLmCodec};
 use futures_util::stream;
 use http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -15,9 +16,12 @@ use http::{
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
 use multer::Multipart;
+use ndarray::Array3;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config::AppConfig;
 use crate::protocol::{
@@ -118,6 +122,14 @@ pub struct PreparedEncodeProgram {
     pub total_gap_seconds: f64,
 }
 
+struct OnnxEncodeRuntime {
+    frame: OnnxFrameCodec,
+    lm: OnnxLmCodec,
+}
+
+static ONNX_RUNTIME_CACHE: OnceLock<Mutex<HashMap<String, Arc<Mutex<OnnxEncodeRuntime>>>>> =
+    OnceLock::new();
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamArtifactSelection {
     Png,
@@ -212,19 +224,7 @@ pub async fn process_prepared_program(
     )
     .await?;
 
-    let tempdir = tempfile::tempdir().context("failed to create tempdir")?;
-    let program_wav = tempdir.path().join("program.wav");
-    let wav_bytes = pcm_bytes_to_wav(
-        &prepared.pcm_bytes,
-        prepared.sample_rate,
-        prepared.channels,
-        prepared.bits_per_sample,
-    )?;
-    tokio::fs::write(&program_wav, wav_bytes)
-        .await
-        .with_context(|| format!("failed to write {}", program_wav.display()))?;
-
-    let ecdc = run_encodec(config, &program_wav, prepared.quality).await?;
+    let ecdc = run_encodec(config, &prepared).await?;
 
     emit_progress(
         progress,
@@ -506,42 +506,155 @@ pub fn headers_to_json(headers: &[(String, String)]) -> Value {
     Value::Object(map)
 }
 
-async fn run_encodec(
+fn runtime_cache() -> &'static Mutex<HashMap<String, Arc<Mutex<OnnxEncodeRuntime>>>> {
+    ONNX_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bundle_name_for_quality(quality: EncodeQuality) -> &'static str {
+    match quality {
+        EncodeQuality::Standard => "encodec_48khz_6kbps",
+        EncodeQuality::Hq => "encodec_48khz_12kbps",
+    }
+}
+
+fn bundle_dir_for_quality(config: &AppConfig, quality: EncodeQuality) -> PathBuf {
+    Path::new(&config.encodec_onnx_bundle_root).join(bundle_name_for_quality(quality))
+}
+
+fn execution_target_for_bundle(config: &AppConfig, bundle_dir: &Path) -> Result<ExecutionTarget> {
+    let label = config.execution_target_label().trim().to_ascii_lowercase();
+    match label.as_str() {
+        "cpu" => Ok(ExecutionTarget::Cpu),
+        "gpu" | "cuda" => Ok(ExecutionTarget::Cuda {
+            device_id: config.encodec_device_id,
+        }),
+        "tensorrt" | "trt" => Ok(ExecutionTarget::TensorRt {
+            device_id: config.encodec_device_id,
+            fp16: false,
+            engine_cache_path: Some(bundle_dir.join(".trt-cache/engines")),
+            timing_cache_path: Some(bundle_dir.join(".trt-cache/timing.cache")),
+        }),
+        other => {
+            bail!("unsupported ENCODEC_EXECUTION_TARGET {other:?}; use cpu, cuda, gpu, or tensorrt")
+        }
+    }
+}
+
+fn load_onnx_runtime(
     config: &AppConfig,
-    input_wav: &Path,
     quality: EncodeQuality,
-) -> Result<Bytes> {
-    let output_ecdc = input_wav.with_extension("ecdc");
-    let input_path = input_wav.to_path_buf();
-    let output_path = output_ecdc.clone();
-    let encodec = if let Some(python) = &config.encodec_python {
-        Encodec::with_python_module(python)
-    } else {
-        Encodec::with_binary(config.encodec_bin.clone())
-    };
+) -> Result<Arc<Mutex<OnnxEncodeRuntime>>> {
+    let bundle_dir = bundle_dir_for_quality(config, quality);
+    let target = execution_target_for_bundle(config, &bundle_dir)?;
+    let cache_key = format!("{}::{target:?}", bundle_dir.display());
 
-    tokio::task::spawn_blocking(move || {
-        encodec.encode_file(
-            &input_path,
-            &output_path,
-            &EncodecOptions {
-                bandwidth: Some(quality.bandwidth_kbps()),
-                // The scratch.fm path always needs the 48 kHz stereo model.
-                high_quality: true,
-                language_model: true,
-                force: true,
-                rescale: false,
-            },
+    if let Some(runtime) = runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("encodec runtime cache mutex poisoned"))?
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(runtime);
+    }
+
+    let frame = OnnxFrameCodec::from_dir(&bundle_dir, target.clone()).with_context(|| {
+        format!(
+            "failed to load EnCodec ONNX frame bundle from {}",
+            bundle_dir.display()
         )
-    })
-    .await
-    .context("encodec worker task panicked")?
-    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    })?;
+    let lm = OnnxLmCodec::from_dir(&bundle_dir, target).with_context(|| {
+        format!(
+            "failed to load EnCodec ONNX language model bundle from {}",
+            bundle_dir.display()
+        )
+    })?;
+    let runtime = Arc::new(Mutex::new(OnnxEncodeRuntime { frame, lm }));
 
-    let bytes = tokio::fs::read(&output_ecdc)
+    runtime_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("encodec runtime cache mutex poisoned"))?
+        .insert(cache_key, runtime.clone());
+
+    Ok(runtime)
+}
+
+fn prepared_pcm_to_audio(
+    prepared: &PreparedEncodeProgram,
+    expected_channels: usize,
+    expected_sample_rate: usize,
+) -> Result<Array3<f32>> {
+    anyhow::ensure!(
+        prepared.sample_rate as usize == expected_sample_rate,
+        "prepared PCM sample rate {} does not match bundle sample rate {}",
+        prepared.sample_rate,
+        expected_sample_rate
+    );
+    anyhow::ensure!(
+        prepared.channels as usize == expected_channels,
+        "prepared PCM channels {} do not match bundle channels {}",
+        prepared.channels,
+        expected_channels
+    );
+    anyhow::ensure!(
+        prepared.bits_per_sample == 16,
+        "encodec-api currently expects canonical s16le PCM, got {} bits",
+        prepared.bits_per_sample
+    );
+
+    let bytes_per_frame = expected_channels
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("invalid channel count"))?;
+    anyhow::ensure!(
+        prepared.pcm_bytes.len() % bytes_per_frame == 0,
+        "prepared PCM length {} is not aligned to {} bytes/frame",
+        prepared.pcm_bytes.len(),
+        bytes_per_frame
+    );
+
+    let frames = prepared.pcm_bytes.len() / bytes_per_frame;
+    let mut audio = Array3::<f32>::zeros((1, expected_channels, frames));
+    for frame in 0..frames {
+        let frame_base = frame * bytes_per_frame;
+        for channel in 0..expected_channels {
+            let offset = frame_base + channel * 2;
+            let sample =
+                i16::from_le_bytes([prepared.pcm_bytes[offset], prepared.pcm_bytes[offset + 1]]);
+            audio[[0, channel, frame]] = sample as f32 / 32768.0;
+        }
+    }
+
+    Ok(audio)
+}
+
+fn encode_with_onnx_runtime(
+    config: &AppConfig,
+    prepared: &PreparedEncodeProgram,
+) -> Result<Vec<u8>> {
+    let runtime = load_onnx_runtime(config, prepared.quality)?;
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("encodec runtime mutex poisoned"))?;
+    let OnnxEncodeRuntime { frame, lm } = &mut *runtime;
+    let meta = frame.metadata().clone();
+    let audio = prepared_pcm_to_audio(prepared, meta.channels, meta.sample_rate)?;
+    encode_audio_to_ecdc_with_options(
+        frame,
+        Some(lm),
+        &audio,
+        None,
+        config.encodec_frame_batch_size,
+        false,
+    )
+}
+
+async fn run_encodec(config: &AppConfig, prepared: &PreparedEncodeProgram) -> Result<Bytes> {
+    let config = config.clone();
+    let prepared = prepared.clone();
+    tokio::task::spawn_blocking(move || encode_with_onnx_runtime(&config, &prepared))
         .await
-        .with_context(|| format!("failed to read {}", output_ecdc.display()))?;
-    Ok(Bytes::from(bytes))
+        .context("encodec worker task panicked")?
+        .map(Bytes::from)
 }
 
 fn bytes_to_png(data: &[u8]) -> Result<(Bytes, usize)> {

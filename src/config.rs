@@ -47,17 +47,24 @@ pub struct AppConfig {
     #[arg(long, env = "TLS_KEY_PATH")]
     pub tls_key_path: Option<String>,
 
-    #[arg(long, env = "ENCODEC_BIN", default_value = "encodec")]
-    pub encodec_bin: String,
-
-    #[arg(long, env = "ENCODEC_PYTHON")]
-    pub encodec_python: Option<String>,
-
-    #[arg(long, env = "ENCODEC_BACKEND", default_value = "external-encodec")]
+    #[arg(long, env = "ENCODEC_BACKEND", default_value = "encodec-rs-onnx")]
     pub encodec_backend: String,
 
     #[arg(long, env = "ENCODEC_EXECUTION_TARGET")]
     pub encodec_execution_target: Option<String>,
+
+    #[arg(
+        long,
+        env = "ENCODEC_ONNX_BUNDLE_ROOT",
+        default_value = "/opt/encodec-rs/onnx-bundles"
+    )]
+    pub encodec_onnx_bundle_root: String,
+
+    #[arg(long, env = "ENCODEC_DEVICE_ID", default_value_t = 0)]
+    pub encodec_device_id: i32,
+
+    #[arg(long, env = "ENCODEC_FRAME_BATCH_SIZE", default_value_t = 8)]
+    pub encodec_frame_batch_size: usize,
 
     #[arg(long, env = "UPLOAD_RESPONSE_NUM_STREAMS", default_value_t = 2)]
     pub upload_response_num_streams: usize,
@@ -108,12 +115,16 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.port > 0, "PORT must be > 0");
         anyhow::ensure!(
-            !self.encodec_bin.trim().is_empty(),
-            "ENCODEC_BIN must not be empty"
-        );
-        anyhow::ensure!(
             !self.encodec_backend.trim().is_empty(),
             "ENCODEC_BACKEND must not be empty"
+        );
+        anyhow::ensure!(
+            !self.encodec_onnx_bundle_root.trim().is_empty(),
+            "ENCODEC_ONNX_BUNDLE_ROOT must not be empty"
+        );
+        anyhow::ensure!(
+            self.encodec_frame_batch_size > 0,
+            "ENCODEC_FRAME_BATCH_SIZE must be > 0"
         );
         anyhow::ensure!(
             self.upload_response_num_streams > 0,

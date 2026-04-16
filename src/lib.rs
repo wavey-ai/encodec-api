@@ -90,11 +90,9 @@ pub async fn run(config: AppConfig) -> Result<()> {
         enable_h3 = config.enable_h3,
         encodec_backend = %config.encodec_backend_label(),
         encodec_execution_target = %config.execution_target_label(),
-        encodec_bin = %config.encodec_bin,
-        encodec_python = %config
-            .encodec_python
-            .as_deref()
-            .unwrap_or("-"),
+        encodec_onnx_bundle_root = %config.encodec_onnx_bundle_root,
+        encodec_device_id = config.encodec_device_id,
+        encodec_frame_batch_size = config.encodec_frame_batch_size,
         upload_response_num_streams = config.upload_response_num_streams,
         upload_response_slot_size_kb = config.upload_response_slot_size_kb,
         upload_response_slots_per_stream = config.upload_response_slots_per_stream,

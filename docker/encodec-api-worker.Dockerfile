@@ -50,32 +50,28 @@ RUN --mount=type=secret,id=github_token \
     fi; \
     cargo build --release --locked
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+RUN set -eu; \
+    bundle_root="$(find /usr/local/cargo/git/checkouts -maxdepth 4 -type d -path '*/onnx-bundles' | head -n 1)"; \
+    test -n "${bundle_root}"; \
+    mkdir -p /app/onnx-bundles; \
+    cp -R "${bundle_root}/." /app/onnx-bundles/
 
-ARG ENCODEC_FORK_REV=e5c7ffd29c55cb88cae57430a917164f42943ce9
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libsndfile1 \
-    python3 \
-    python3-venv \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=opus /usr/local/lib/libopus.so* /usr/local/lib/
 
-RUN python3 -m venv /opt/encodec-env \
-  && /opt/encodec-env/bin/pip install --no-cache-dir --upgrade pip \
-  && /opt/encodec-env/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu124 torch==2.5.1 torchaudio==2.5.1 \
-  && /opt/encodec-env/bin/pip install --no-cache-dir soundfile \
-  && /opt/encodec-env/bin/pip install --no-cache-dir "https://github.com/wavey-ai/encodec/archive/${ENCODEC_FORK_REV}.tar.gz"
-
 COPY --from=build /app/target/release/encodec-api /usr/local/bin/encodec-api
+COPY --from=build /app/onnx-bundles /opt/encodec-rs/onnx-bundles
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV ENCODEC_API_ROLE=worker
-ENV ENCODEC_BIN=/opt/encodec-env/bin/encodec
+ENV ENCODEC_ONNX_BUNDLE_ROOT=/opt/encodec-rs/onnx-bundles
 ENV PORT=8443
 EXPOSE 8443
 

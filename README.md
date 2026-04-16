@@ -15,7 +15,7 @@ Target architecture:
 - ingress owns the public HTTPS surface and the `upload-response` cache
 - ingress normalizes uploaded media into canonical PCM through `av-api` + `soundkit`
 - workers poll ingress over the private `/_upload_response` plane
-- worker-side EnCodec execution handles `/encode`, `/encode/ecdc`, and `/encode/stream`
+- worker-side `encodec-rs` ONNX execution handles `/encode`, `/encode/ecdc`, and `/encode/stream`
 - `/encode/stream` returns NDJSON event frames over streamed HTTP and websocket transports
 - worker scaling is via deployment replicas plus `UPLOAD_RESPONSE_MAX_INFLIGHT`
 
@@ -24,8 +24,8 @@ Notes:
 - `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster labeled `wavey-us-ord`.
 - The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
 - Ingress is CPU-only and is responsible for upload parsing, media decode, and canonical PCM preparation through `av-api` + `soundkit`.
-- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run the Wavey `encodec` fork through the external `encodec` runtime today.
-- `encodec-rs` is already part of the repo boundary, but the worker does not yet use the ONNX path in production. The current production encode backend is still the external EnCodec runtime.
+- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run pure-Rust `encodec-rs` with ONNX bundles baked into the image.
+- The worker path no longer shells out to Python or an external `encodec` binary.
 
 ## GitHub secrets and variables
 
@@ -55,7 +55,8 @@ Variables:
 ## Local run
 
 ```bash
-cargo run -- --port 8443 --encodec-bin "$(command -v encodec)"
+ENCODEC_ONNX_BUNDLE_ROOT=/Users/jamieb/wavey.ai/encodec-rs/onnx-bundles \
+cargo run -- --port 8443
 ```
 
 Health check:
@@ -68,10 +69,14 @@ Split local dev:
 
 ```bash
 # ingress
-PORT=8443 ENCODEC_API_ROLE=ingress cargo run
+PORT=8443 ENCODEC_API_ROLE=ingress \
+ENCODEC_ONNX_BUNDLE_ROOT=/Users/jamieb/wavey.ai/encodec-rs/onnx-bundles \
+cargo run
 
 # worker
 PORT=9443 ENCODEC_API_ROLE=worker \
+ENCODEC_ONNX_BUNDLE_ROOT=/Users/jamieb/wavey.ai/encodec-rs/onnx-bundles \
+ENCODEC_EXECUTION_TARGET=cpu \
 UPLOAD_RESPONSE_INGRESS_URLS=https://127.0.0.1:8443 \
 UPLOAD_RESPONSE_INSECURE_TLS=true \
 cargo run
