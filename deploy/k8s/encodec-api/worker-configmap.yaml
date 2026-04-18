@@ -8,7 +8,7 @@ data:
   PORT: "8443"
   ENABLE_H3: "false"
   ENCODEC_BACKEND: encodec-rs-onnx
-  ENCODEC_ONNX_BUNDLE_ROOT: /opt/encodec-rs/onnx-bundles
+  ENCODEC_ONNX_BUNDLE_ROOT: /var/lib/encodec-api/models/onnx-bundles
   ENCODEC_EXECUTION_TARGET: cuda
   ENCODEC_DEVICE_ID: "0"
   ENCODEC_FRAME_BATCH_SIZE: "8"

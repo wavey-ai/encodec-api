@@ -36,10 +36,46 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: nvidia.com/gpu.present
+                  - key: wavey.ai/gpu
                     operator: In
                     values:
                       - "true"
+      initContainers:
+        - name: seed-bundles
+          image: ghcr.io/wavey-ai/encodec-api-worker:main
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+              src="/opt/encodec-rs/onnx-bundles"
+              dst="/var/lib/encodec-api/models/onnx-bundles"
+              if [ ! -f "${dst}/encodec_48khz_6kbps/bundle.json" ] || [ ! -f "${dst}/encodec_48khz_12kbps/bundle.json" ]; then
+                rm -rf "${dst}"
+                mkdir -p "${dst}"
+                cp -R "${src}/." "${dst}/"
+              fi
+          volumeMounts:
+            - name: model
+              mountPath: /var/lib/encodec-api/models
+        - name: verify-bundles
+          image: busybox:1.36
+          command:
+            - sh
+            - -lc
+            - |
+              set -eu
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/bundle.json
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/encode_frame.onnx
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/decode_frame.onnx
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/lm_logits.onnx
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/bundle.json
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/encode_frame.onnx
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/decode_frame.onnx
+              test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/lm_logits.onnx
+          volumeMounts:
+            - name: model
+              mountPath: /var/lib/encodec-api/models
       containers:
         - name: worker
           image: ghcr.io/wavey-ai/encodec-api-worker:main
@@ -56,6 +92,8 @@ spec:
             - name: TLS_KEY_PATH
               value: /var/run/encodec-api/tls/tls.key
           volumeMounts:
+            - name: model
+              mountPath: /var/lib/encodec-api/models
             - name: tls
               mountPath: /var/run/encodec-api/tls
               readOnly: true
@@ -92,6 +130,9 @@ spec:
               memory: 16Gi
               nvidia.com/gpu: "1"
       volumes:
+        - name: model
+          persistentVolumeClaim:
+            claimName: encodec-api-model
         - name: tls
           secret:
             secretName: encodec-api-tls

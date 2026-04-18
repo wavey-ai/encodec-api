@@ -16,9 +16,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ENCODEC_API_CLUSTER_LABEL: wavey-us-ord
   ENCODEC_API_NAMESPACE: encodec-api
   ENCODEC_API_DOMAIN: encodec.wavey.ai
+  ENCODEC_API_EDGE_IP: 172.238.175.161
   ENCODEC_API_INGRESS_IMAGE_REPO: ghcr.io/wavey-ai/encodec-api-ingress
   ENCODEC_API_WORKER_IMAGE_REPO: ghcr.io/wavey-ai/encodec-api-worker
   ENCODEC_API_KUSTOMIZE_PATH: deploy/k8s/encodec-api
@@ -52,7 +52,7 @@ jobs:
           set -euo pipefail
           cargo metadata --locked --no-deps >/dev/null
           python3 -m py_compile deploy/linode_api.py
-          bash -n deploy/lke/manual-deploy.sh
+          bash -n deploy/kubeadm/manual-deploy.sh
           kubectl kustomize "$ENCODEC_API_KUSTOMIZE_PATH" >/dev/null
 
       - name: Detect image changes
@@ -140,43 +140,31 @@ jobs:
           sys.exit(1)
           PY
 
-      - name: Resolve LKE cluster
-        id: cluster
-        env:
-          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
-        run: |
-          set -euo pipefail
-          python3 deploy/linode_api.py cluster-id \
-            --label "$ENCODEC_API_CLUSTER_LABEL" \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: Fetch cluster kubeconfig
+      - name: Materialize kubeadm kubeconfig
         id: kubeconfig
-        env:
-          LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
         run: |
           set -euo pipefail
           kubeconfig_path="$RUNNER_TEMP/wavey-kubeconfig.yaml"
-          python3 deploy/linode_api.py cluster-kubeconfig \
-            --cluster-id "${{ steps.cluster.outputs.cluster_id }}" \
-            --output "$kubeconfig_path" \
-            --github-output "$GITHUB_OUTPUT"
+          if [ -z "${{ secrets.KUBEADM_CLUSTER_KUBECONFIG_B64 }}" ]; then
+            echo "missing KUBEADM_CLUSTER_KUBECONFIG_B64 secret" >&2
+            exit 1
+          fi
+          printf '%s' "${{ secrets.KUBEADM_CLUSTER_KUBECONFIG_B64 }}" | base64 -d >"$kubeconfig_path"
+          chmod 600 "$kubeconfig_path"
+          echo "kubeconfig=$kubeconfig_path" >>"$GITHUB_OUTPUT"
 
-      - name: Deploy encodec-api to LKE
+      - name: Deploy encodec-api to kubeadm cluster
         env:
           KUBECONFIG: ${{ steps.kubeconfig.outputs.kubeconfig }}
           LINODE_TOKEN: ${{ secrets.LINODE_TOKEN }}
           REGISTRY_SERVER: ${{ env.ENCODEC_API_REGISTRY }}
           REGISTRY_USERNAME: jbrough
           REGISTRY_PASSWORD: ${{ secrets.WAVEY_AI_GH_TOKEN }}
+          ENCODEC_API_EDGE_IP: ${{ env.ENCODEC_API_EDGE_IP }}
           ENCODEC_API_INGRESS_REPLICAS: ${{ vars.ENCODEC_API_INGRESS_REPLICAS || '1' }}
           ENCODEC_API_WORKER_REPLICAS: ${{ vars.ENCODEC_API_WORKER_REPLICAS || '1' }}
         run: |
           set -euo pipefail
-
-          kubectl label nodes -l node.kubernetes.io/instance-type=g2-gpu-rtx4000a1-s \
-            nvidia.com/gpu.present=true \
-            --overwrite || true
 
           ingress_image="${ENCODEC_API_INGRESS_IMAGE_REPO}:main"
           worker_image="${ENCODEC_API_WORKER_IMAGE_REPO}:main"
@@ -207,4 +195,4 @@ jobs:
 
           ENCODEC_API_INGRESS_IMAGE="$ingress_image" \
           ENCODEC_API_WORKER_IMAGE="$worker_image" \
-          bash deploy/lke/manual-deploy.sh
+          bash deploy/kubeadm/manual-deploy.sh

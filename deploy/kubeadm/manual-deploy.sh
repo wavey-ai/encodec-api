@@ -14,6 +14,9 @@ ENCODEC_API_INGRESS_IMAGE="${ENCODEC_API_INGRESS_IMAGE:-ghcr.io/wavey-ai/encodec
 ENCODEC_API_WORKER_IMAGE="${ENCODEC_API_WORKER_IMAGE:-ghcr.io/wavey-ai/encodec-api-worker:main}"
 ENCODEC_API_INGRESS_REPLICAS="${ENCODEC_API_INGRESS_REPLICAS:-1}"
 ENCODEC_API_WORKER_REPLICAS="${ENCODEC_API_WORKER_REPLICAS:-1}"
+ENCODEC_API_EDGE_IP="${ENCODEC_API_EDGE_IP:-172.238.175.161}"
+ENCODEC_API_GPU_NODE="${ENCODEC_API_GPU_NODE:-wavey-kubeadm-gpu-01}"
+ENCODEC_API_MODEL_PATH="${ENCODEC_API_MODEL_PATH:-/var/lib/encodec-api/models}"
 
 tmpdir="$(mktemp -d)"
 cleanup() {
@@ -38,10 +41,39 @@ openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
   >/dev/null 2>&1
 
 kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
-kubectl -n "$ENCODEC_API_NAMESPACE" delete pod -l wavey.ai/image-loader=true --ignore-not-found=true --wait=true || true
-kubectl label nodes -l node.kubernetes.io/instance-type=g2-gpu-rtx4000a1-s \
-  nvidia.com/gpu.present=true \
-  --overwrite || true
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: encodec-api-model-bootstrap
+  namespace: ${ENCODEC_API_NAMESPACE}
+spec:
+  nodeName: ${ENCODEC_API_GPU_NODE}
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: bootstrap
+      image: busybox:1.36
+      command:
+        - sh
+        - -lc
+        - |
+          set -eu
+          mkdir -p /model-store
+      volumeMounts:
+        - name: model-store
+          mountPath: /model-store
+  volumes:
+    - name: model-store
+      hostPath:
+        path: ${ENCODEC_API_MODEL_PATH}
+        type: DirectoryOrCreate
+EOF
+
+kubectl -n "$ENCODEC_API_NAMESPACE" wait --for=condition=Ready pod/encodec-api-model-bootstrap --timeout=180s
+kubectl -n "$ENCODEC_API_NAMESPACE" delete pod/encodec-api-model-bootstrap --wait=true
 
 kubectl -n "$ENCODEC_API_NAMESPACE" create secret docker-registry ghcr-wavey-ai \
   --docker-server="$REGISTRY_SERVER" \
@@ -61,7 +93,7 @@ kubectl -n "$ENCODEC_API_NAMESPACE" create secret tls encodec-wavey-ai-tls \
 
 kubectl apply -k "$ENCODEC_API_KUSTOMIZE_PATH"
 kubectl -n "$ENCODEC_API_NAMESPACE" set image deployment/encodec-api-ingress ingress="$ENCODEC_API_INGRESS_IMAGE"
-kubectl -n "$ENCODEC_API_NAMESPACE" set image deployment/encodec-api-worker worker="$ENCODEC_API_WORKER_IMAGE"
+kubectl -n "$ENCODEC_API_NAMESPACE" set image deployment/encodec-api-worker worker="$ENCODEC_API_WORKER_IMAGE" seed-bundles="$ENCODEC_API_WORKER_IMAGE"
 kubectl -n "$ENCODEC_API_NAMESPACE" scale deployment/encodec-api-ingress --replicas="$ENCODEC_API_INGRESS_REPLICAS"
 kubectl -n "$ENCODEC_API_NAMESPACE" scale deployment/encodec-api-worker --replicas="$ENCODEC_API_WORKER_REPLICAS"
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout restart deployment/encodec-api-ingress
@@ -69,28 +101,11 @@ kubectl -n "$ENCODEC_API_NAMESPACE" rollout restart deployment/encodec-api-worke
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout status deployment/encodec-api-ingress --timeout=20m
 kubectl -n "$ENCODEC_API_NAMESPACE" rollout status deployment/encodec-api-worker --timeout=30m
 
-ingress_ip=""
-for _ in $(seq 1 60); do
-  ingress_ip="$(kubectl -n "$ENCODEC_API_NAMESPACE" get ingress encodec-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-  if [[ -z "$ingress_ip" ]]; then
-    ingress_ip="$(kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-  fi
-  if [[ -n "$ingress_ip" ]]; then
-    break
-  fi
-  sleep 5
-done
-
-if [[ -z "$ingress_ip" ]]; then
-  echo "failed to resolve ingress IP" >&2
-  exit 1
-fi
-
 python3 deploy/linode_api.py upsert-domain-a-record \
   --domain wavey.ai \
   --name encodec \
-  --target "$ingress_ip" \
+  --target "$ENCODEC_API_EDGE_IP" \
   --ttl-sec 30
 
-kubectl -n "$ENCODEC_API_NAMESPACE" get deploy,pods,svc,ingress
-echo "encodec-api deployed to ${ENCODEC_API_DOMAIN} (${ingress_ip})"
+kubectl -n "$ENCODEC_API_NAMESPACE" get pv,pvc,deploy,pods,svc,ingress
+echo "encodec-api deployed to ${ENCODEC_API_DOMAIN} (${ENCODEC_API_EDGE_IP})"

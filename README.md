@@ -8,7 +8,7 @@ Current scope:
 - CPU ingress deployment plus GPU worker deployment
 - remote workers over `upload-response` with split ingress/worker scaling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
-- Linode LKE deploy workflow and manifests for `encodec.wavey.ai`
+- self-managed kubeadm-cluster deploy workflow and manifests for `encodec.wavey.ai`
 
 Target architecture:
 
@@ -21,10 +21,11 @@ Target architecture:
 
 Notes:
 
-- `encodec-api` deploys to the shared Wavey Linode Kubernetes Engine cluster labeled `wavey-us-ord`.
-- The deploy workflow resolves cluster access through the Linode API, applies the Kubernetes manifests, and upserts the `encodec.wavey.ai` DNS record in Linode DNS.
+- `encodec-api` deploys to the shared Wavey self-managed kubeadm cluster on Linode.
+- The deploy workflow reads a kubeconfig from GitHub secrets, applies the Kubernetes manifests, and upserts `encodec.wavey.ai` to the CPU ingress node IP in Linode DNS.
 - Ingress is CPU-only and is responsible for upload parsing, media decode, and canonical PCM preparation through `av-api` + `soundkit`.
-- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run pure-Rust `encodec-rs` with ONNX bundles baked into the image.
+- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run pure-Rust `encodec-rs`.
+- ONNX bundles are stored on a static local persistent volume pinned to the GPU node and seeded into that volume from the worker image on first deployment.
 - The worker path no longer shells out to Python or an external `encodec` binary.
 
 ## GitHub secrets and variables
@@ -32,7 +33,8 @@ Notes:
 Secrets:
 
 - `WAVEY_AI_GH_TOKEN`: classic PAT with package access for private dependency fetches and GHCR pulls
-- `LINODE_TOKEN`: token that can read the shared LKE cluster and update Linode DNS
+- `LINODE_TOKEN`: token that updates Linode DNS
+- `KUBEADM_CLUSTER_KUBECONFIG_B64`: base64-encoded kubeconfig for the self-managed cluster
 
 Variables:
 
@@ -50,7 +52,7 @@ Variables:
 
 - manifests: `deploy/k8s/encodec-api/`
 - Linode helper: `deploy/linode_api.py`
-- helper script: `deploy/lke/manual-deploy.sh`
+- helper script: `deploy/kubeadm/manual-deploy.sh`
 
 ## Local run
 

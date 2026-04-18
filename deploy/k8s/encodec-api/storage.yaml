@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: encodec-api-model-gpu-01
+spec:
+  capacity:
+    storage: 8Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: encodec-api-local-retain
+  local:
+    path: /var/lib/encodec-api/models
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - wavey-kubeadm-gpu-01
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: encodec-api-model
+  namespace: encodec-api
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: encodec-api-local-retain
+  volumeName: encodec-api-model-gpu-01
+  resources:
+    requests:
+      storage: 8Gi

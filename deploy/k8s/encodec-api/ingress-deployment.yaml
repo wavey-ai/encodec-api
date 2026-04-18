@@ -29,8 +29,10 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: nvidia.com/gpu.present
-                    operator: DoesNotExist
+                  - key: wavey.ai/ingress
+                    operator: In
+                    values:
+                      - "true"
       containers:
         - name: ingress
           image: ghcr.io/wavey-ai/encodec-api-ingress:main
