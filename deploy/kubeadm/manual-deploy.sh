@@ -42,6 +42,8 @@ openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
 
 kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
 
+kubectl -n "$ENCODEC_API_NAMESPACE" delete pod/encodec-api-model-bootstrap --ignore-not-found --wait=true
+
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -72,7 +74,7 @@ spec:
         type: DirectoryOrCreate
 EOF
 
-kubectl -n "$ENCODEC_API_NAMESPACE" wait --for=condition=Ready pod/encodec-api-model-bootstrap --timeout=180s
+kubectl -n "$ENCODEC_API_NAMESPACE" wait --for=jsonpath='{.status.phase}'=Succeeded pod/encodec-api-model-bootstrap --timeout=180s
 kubectl -n "$ENCODEC_API_NAMESPACE" delete pod/encodec-api-model-bootstrap --wait=true
 
 kubectl -n "$ENCODEC_API_NAMESPACE" create secret docker-registry ghcr-wavey-ai \
