@@ -7,6 +7,7 @@ Current scope:
 - split-role service on the Wavey `web-service` crate
 - CPU ingress deployment plus GPU worker deployment
 - remote workers over `upload-response` with split ingress/worker scaling
+- reusable GHCR base image for Opus 1.5.2 build tooling
 - GHCR image builds for `encodec-api-ingress` and `encodec-api-worker`
 - self-managed kubeadm-cluster deploy workflow and manifests for `encodec.wavey.ai`
 
@@ -47,6 +48,12 @@ Variables:
 
 - `.github/workflows/build-image.yml`
 - `.github/workflows/deploy-main.yml`
+
+The image workflow now publishes:
+
+- `ghcr.io/wavey-ai/encodec-api-opus-base`
+- `ghcr.io/wavey-ai/encodec-api-ingress`
+- `ghcr.io/wavey-ai/encodec-api-worker`
 
 ## Deploy layout
 

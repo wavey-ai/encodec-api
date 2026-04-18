@@ -25,7 +25,53 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  build-base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute short SHA
+        id: short_sha
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/wavey-ai/encodec-api-opus-base
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      - name: Build and push opus base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/encodec-api-opus-base.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=encodec-api-opus-base
+          cache-to: |
+            type=gha,scope=encodec-api-opus-base,mode=max
+
   build:
+    needs: build-base
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +110,10 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
 
+      - name: Compute short SHA
+        id: short_sha
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push ${{ matrix.component }} image
         uses: docker/build-push-action@v6
         with:
@@ -71,6 +121,8 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: true
+          build-args: |
+            OPUS_BASE_IMAGE=ghcr.io/wavey-ai/encodec-api-opus-base:sha-${{ steps.short_sha.outputs.value }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: |
