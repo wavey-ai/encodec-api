@@ -36,7 +36,11 @@ spec:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
-                  - key: wavey.ai/gpu
+                  - key: nvidia.com/gpu.present
+                    operator: In
+                    values:
+                      - "true"
+                  - key: wavey.ai/gpu-vram-free-ge-3072mib
                     operator: In
                     values:
                       - "true"
@@ -124,9 +128,11 @@ spec:
             requests:
               cpu: "1"
               memory: 2Gi
+              nvidia.com/gpu: "1"
             limits:
               cpu: "3"
               memory: 6Gi
+              nvidia.com/gpu: "1"
       volumes:
         - name: model
           persistentVolumeClaim:

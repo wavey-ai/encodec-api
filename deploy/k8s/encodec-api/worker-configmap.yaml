@@ -9,7 +9,7 @@ data:
   ENABLE_H3: "false"
   ENCODEC_BACKEND: encodec-rs-onnx
   ENCODEC_ONNX_BUNDLE_ROOT: /var/lib/encodec-api/models/onnx-bundles
-  ENCODEC_EXECUTION_TARGET: cpu
+  ENCODEC_EXECUTION_TARGET: cuda
   ENCODEC_FRAME_BATCH_SIZE: "8"
   UPLOAD_RESPONSE_WORKER_ID: encodec-api-worker
   UPLOAD_RESPONSE_WORKER_POLL_MS: "10"
