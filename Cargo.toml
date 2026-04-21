@@ -14,7 +14,7 @@ base64 = "0.22"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-encodec-rs = { git = "https://github.com/wavey-ai/encodec-rs.git", rev = "8e52ac5c0e9d764d014be2ae5fffc91235569647", features = ["onnx"] }
+encodec-rs = { git = "https://github.com/wavey-ai/encodec-rs.git", rev = "c4254f8fd81873470da5f16174c267dd67b37fa9", features = ["onnx"] }
 futures-util = "0.3"
 http = "1.3"
 http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }

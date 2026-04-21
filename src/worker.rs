@@ -4,6 +4,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http::{header::CONTENT_TYPE, Request, StatusCode};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -18,10 +19,12 @@ use web_service::HandlerResponse;
 
 use crate::config::AppConfig;
 use crate::encode::{
-    build_artifacts_from_ecdc, headers_to_json, parse_request,
-    prepared_program_from_internal_request, process_parsed_request, process_prepared_program,
-    process_request, response_headers, start_streaming_encodec, stream_artifact_selection,
-    EncodeArtifacts, PreparedEncodeProgram, ProgressSink, StreamArtifactSelection,
+    build_artifacts_from_ecdc, finalize_prepared_audio_key_digest, headers_to_json, parse_request,
+    pcm_duration_seconds, prepared_program_from_internal_request,
+    prepared_request_envelope_from_internal_request, process_parsed_request,
+    process_prepared_program, process_request, response_headers,
+    start_incremental_streaming_encodec, stream_artifact_selection, EncodeArtifacts,
+    PreparedEncodeProgram, PreparedRequestEnvelope, ProgressSink, StreamArtifactSelection,
 };
 use crate::protocol::{INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL};
 
@@ -306,30 +309,13 @@ impl WorkerState {
             }))
             .await?;
 
-        let body = self
-            .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
-            .await?;
-        info!(
-            %origin,
-            stream_id,
-            request_id = %request_id,
-            body_bytes = body.len(),
-            "received streamed upload body"
-        );
         let artifacts = if let Some(prepared) =
-            prepared_program_from_internal_request(&request, &body)?
+            prepared_request_envelope_from_internal_request(&request)?
         {
-            writer
-                .send_value(json!({
-                    "type": "Request",
-                    "request_id": request_id.as_str(),
-                    "track_count": prepared.track_count,
-                    "quality": prepared.quality.as_str(),
-                    "gap_seconds": prepared.gap_seconds,
-                    "audio_key": prepared.audio_key.as_str(),
-                }))
-                .await?;
-            self.process_streaming_prepared_upload(
+            self.process_streaming_prepared_remote_upload(
+                client,
+                origin,
+                stream_id,
                 request_id.as_str(),
                 artifact_selection,
                 prepared,
@@ -337,6 +323,16 @@ impl WorkerState {
             )
             .await?
         } else {
+            let body = self
+                .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
+                .await?;
+            info!(
+                %origin,
+                stream_id,
+                request_id = %request_id,
+                body_bytes = body.len(),
+                "received streamed upload body"
+            );
             let parsed = parse_request(&request, body).await?;
             writer
                 .send_value(json!({
@@ -492,11 +488,14 @@ impl WorkerState {
         Ok(Bytes::from(buffer))
     }
 
-    async fn process_streaming_prepared_upload(
+    async fn process_streaming_prepared_remote_upload(
         &self,
+        client: &RemoteIngressClient,
+        origin: &str,
+        stream_id: u64,
         request_id: &str,
         selection: StreamArtifactSelection,
-        prepared: PreparedEncodeProgram,
+        prepared: PreparedRequestEnvelope,
         writer: &mut JsonLineResponseWriter,
     ) -> Result<EncodeArtifacts> {
         writer
@@ -504,7 +503,6 @@ impl WorkerState {
                 "type": "Progress",
                 "status": "loading",
                 "msg": "Prepared canonical stereo PCM",
-                "duration": round_one(prepared.duration_seconds),
             }))
             .await?;
         writer
@@ -512,19 +510,25 @@ impl WorkerState {
                 "type": "Progress",
                 "status": "encoding",
                 "msg": "Encoding with EnCodec...",
-                "duration": round_one(prepared.duration_seconds),
                 "bandwidthKbps": prepared.quality.bandwidth_kbps(),
             }))
             .await?;
 
-        let mut handle = start_streaming_encodec(&self.config, &prepared);
-        let mut artifact_chunks = 0usize;
-        let mut pending_ecdc = Vec::new();
+        let mut handle = start_incremental_streaming_encodec(&self.config, &prepared);
+        let mut poll = interval(Duration::from_millis(
+            self.config.upload_response_worker_poll_ms.max(1),
+        ));
+        let mut last_slot = 1usize;
+        let mut last_reported_bytes = 0usize;
+        let mut bytes_received = 0usize;
+        let mut digest = Sha256::new();
+        let mut saw_body = false;
         info!(
+            %origin,
+            stream_id,
             request_id,
-            duration = prepared.duration_seconds,
-            bandwidth_kbps = prepared.quality.bandwidth_kbps(),
-            "encoding prepared streaming upload"
+            quality = %prepared.quality.as_str(),
+            "encoding streamed prepared PCM upload"
         );
 
         if selection.includes_ecdc() {
@@ -532,6 +536,98 @@ impl WorkerState {
                 .await?;
         }
 
+        'stream: loop {
+            poll.tick().await;
+            let current_last = client.request_last(origin, stream_id).await?;
+            if current_last <= last_slot {
+                continue;
+            }
+
+            for slot_id in (last_slot + 1)..=current_last {
+                match client.request_slot(origin, stream_id, slot_id).await? {
+                    Some(RemoteRequestSlot::Body(bytes)) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        saw_body = true;
+                        bytes_received += bytes.len();
+                        digest.update(&bytes);
+                        handle.send_pcm_chunk(bytes)?;
+                        if bytes_received.saturating_sub(last_reported_bytes)
+                            >= STREAM_UPLOAD_PROGRESS_BYTES
+                        {
+                            last_reported_bytes = bytes_received;
+                            writer
+                                .send_value(json!({
+                                    "type": "UploadProgress",
+                                    "request_id": request_id,
+                                    "bytes_received": bytes_received,
+                                }))
+                                .await?;
+                        }
+                    }
+                    Some(RemoteRequestSlot::Control(RequestControl::Finalize)) => {
+                        writer
+                            .send_value(json!({
+                                "type": "UploadProgress",
+                                "request_id": request_id,
+                                "bytes_received": bytes_received,
+                                "finalize": true,
+                            }))
+                            .await?;
+                    }
+                    Some(RemoteRequestSlot::Control(RequestControl::KeepAlive)) => {}
+                    Some(RemoteRequestSlot::End) => break 'stream,
+                    Some(RemoteRequestSlot::Headers(_)) | None => {}
+                }
+            }
+
+            last_slot = current_last;
+        }
+
+        anyhow::ensure!(saw_body, "request body did not include audio bytes");
+        handle.finish_input()?;
+
+        writer
+            .send_value(json!({
+                "type": "UploadComplete",
+                "request_id": request_id,
+                "bytes_received": bytes_received,
+            }))
+            .await?;
+
+        let duration_seconds = prepared.duration_seconds.unwrap_or_else(|| {
+            pcm_duration_seconds(
+                bytes_received,
+                prepared.descriptor.sample_rate,
+                prepared.descriptor.channels,
+                prepared.descriptor.bits_per_sample,
+            )
+        });
+        let audio_key = prepared.audio_key.clone().unwrap_or_else(|| {
+            finalize_prepared_audio_key_digest(
+                digest,
+                &prepared.descriptor,
+                prepared.quality,
+                prepared.track_count,
+                prepared.gap_seconds,
+                prepared.total_gap_seconds,
+            )
+        });
+
+        writer
+            .send_value(json!({
+                "type": "Request",
+                "request_id": request_id,
+                "track_count": prepared.track_count,
+                "quality": prepared.quality.as_str(),
+                "gap_seconds": prepared.gap_seconds,
+                "audio_key": audio_key.as_str(),
+            }))
+            .await?;
+
+        let mut artifact_chunks = 0usize;
+        let mut pending_ecdc = Vec::new();
         while let Some(chunk) = handle.chunks.recv().await {
             if !selection.includes_ecdc() {
                 continue;
@@ -557,7 +653,8 @@ impl WorkerState {
             request_id,
             ecdc_bytes = ecdc.len(),
             artifact_chunks,
-            "finished streaming ECDC encode"
+            duration = duration_seconds,
+            "finished incremental streaming ECDC encode"
         );
 
         if selection.includes_ecdc() {
@@ -590,7 +687,19 @@ impl WorkerState {
             }))
             .await?;
 
-        let artifacts = build_artifacts_from_ecdc(&self.config, &prepared, ecdc)?;
+        let prepared_program = PreparedEncodeProgram {
+            pcm_bytes: Vec::new(),
+            sample_rate: prepared.descriptor.sample_rate,
+            channels: prepared.descriptor.channels,
+            bits_per_sample: prepared.descriptor.bits_per_sample,
+            duration_seconds,
+            quality: prepared.quality,
+            audio_key,
+            track_count: prepared.track_count,
+            gap_seconds: prepared.gap_seconds,
+            total_gap_seconds: prepared.total_gap_seconds,
+        };
+        let artifacts = build_artifacts_from_ecdc(&self.config, &prepared_program, ecdc)?;
         if selection.includes_png() {
             send_artifact_chunks(writer, request_id, "png", "image/png", &artifacts.png).await?;
         }
@@ -752,10 +861,6 @@ async fn send_artifact_end(
         payload.insert("size_bytes".into(), json!(size_bytes));
     }
     writer.send_value(Value::Object(payload)).await
-}
-
-fn round_one(value: f64) -> f64 {
-    (value * 10.0).round() / 10.0
 }
 
 fn is_streaming_request(req: &Request<()>) -> bool {

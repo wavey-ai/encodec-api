@@ -11,8 +11,9 @@ use av_api::program_audio::{
 use bytes::Bytes;
 use encodec_rs::ecdc::{
     encode_audio_to_ecdc_stream_with_options, encode_audio_to_ecdc_with_options,
+    encode_ecdc_header_with_options, encode_ecdc_segment_batch_with_options,
 };
-use encodec_rs::onnx::{ExecutionTarget, OnnxFrameCodec, OnnxLmCodec};
+use encodec_rs::onnx::{ExecutionTarget, OnnxFrameBundleMetadata, OnnxFrameCodec, OnnxLmCodec};
 use futures_util::stream;
 use http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
@@ -129,6 +131,17 @@ pub struct PreparedEncodeProgram {
     pub total_gap_seconds: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedRequestEnvelope {
+    pub descriptor: CachedPcmDescriptor,
+    pub quality: EncodeQuality,
+    pub track_count: usize,
+    pub gap_seconds: f64,
+    pub total_gap_seconds: f64,
+    pub duration_seconds: Option<f64>,
+    pub audio_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PreparedRequestMetadata<'a> {
     pub sample_rate: u32,
@@ -145,6 +158,12 @@ pub struct PreparedRequestMetadata<'a> {
 
 pub struct StreamingEncodeHandle {
     pub chunks: UnboundedReceiver<Bytes>,
+    join: JoinHandle<Result<Bytes>>,
+}
+
+pub struct IncrementalStreamingEncodeHandle {
+    pub chunks: UnboundedReceiver<Bytes>,
+    input: std_mpsc::Sender<Option<Bytes>>,
     join: JoinHandle<Result<Bytes>>,
 }
 
@@ -359,6 +378,51 @@ pub fn prepared_program_from_internal_request(
     request: &Request<()>,
     body: &[u8],
 ) -> Result<Option<PreparedEncodeProgram>> {
+    let Some(prepared) = prepared_request_envelope_from_internal_request(request)? else {
+        return Ok(None);
+    };
+
+    anyhow::ensure!(
+        !body.is_empty(),
+        "prepared internal request body did not include PCM bytes"
+    );
+
+    let duration_seconds = prepared.duration_seconds.unwrap_or_else(|| {
+        pcm_duration_seconds(
+            body.len(),
+            prepared.descriptor.sample_rate,
+            prepared.descriptor.channels,
+            prepared.descriptor.bits_per_sample,
+        )
+    });
+    let audio_key = prepared.audio_key.unwrap_or_else(|| {
+        derive_prepared_audio_key(
+            body,
+            &prepared.descriptor,
+            prepared.quality,
+            prepared.track_count,
+            prepared.gap_seconds,
+            prepared.total_gap_seconds,
+        )
+    });
+
+    Ok(Some(PreparedEncodeProgram {
+        pcm_bytes: body.to_vec(),
+        sample_rate: prepared.descriptor.sample_rate,
+        channels: prepared.descriptor.channels,
+        bits_per_sample: prepared.descriptor.bits_per_sample,
+        duration_seconds,
+        quality: prepared.quality,
+        audio_key,
+        track_count: prepared.track_count,
+        gap_seconds: prepared.gap_seconds,
+        total_gap_seconds: prepared.total_gap_seconds,
+    }))
+}
+
+pub fn prepared_request_envelope_from_internal_request(
+    request: &Request<()>,
+) -> Result<Option<PreparedRequestEnvelope>> {
     if !request.headers().contains_key(PCM_FORMAT_HEADER) {
         return Ok(None);
     }
@@ -375,44 +439,17 @@ pub fn prepared_program_from_internal_request(
     let total_gap_seconds =
         parse_required_header::<f64>(request.headers(), INTERNAL_TOTAL_GAP_SECONDS_HEADER)?;
 
-    anyhow::ensure!(
-        !body.is_empty(),
-        "prepared internal request body did not include PCM bytes"
-    );
-
-    let duration_seconds =
-        optional_parsed_header::<f64>(request.headers(), INTERNAL_DURATION_SECONDS_HEADER)?
-            .unwrap_or_else(|| {
-                pcm_duration_seconds(
-                    body.len(),
-                    descriptor.sample_rate,
-                    descriptor.channels,
-                    descriptor.bits_per_sample,
-                )
-            });
-    let audio_key =
-        optional_header(request.headers(), INTERNAL_AUDIO_KEY_HEADER).unwrap_or_else(|| {
-            derive_prepared_audio_key(
-                body,
-                &descriptor,
-                quality,
-                track_count,
-                gap_seconds,
-                total_gap_seconds,
-            )
-        });
-
-    Ok(Some(PreparedEncodeProgram {
-        pcm_bytes: body.to_vec(),
-        sample_rate: descriptor.sample_rate,
-        channels: descriptor.channels,
-        bits_per_sample: descriptor.bits_per_sample,
-        duration_seconds,
+    Ok(Some(PreparedRequestEnvelope {
+        descriptor,
         quality,
-        audio_key,
         track_count,
         gap_seconds,
         total_gap_seconds,
+        duration_seconds: optional_parsed_header::<f64>(
+            request.headers(),
+            INTERNAL_DURATION_SECONDS_HEADER,
+        )?,
+        audio_key: optional_header(request.headers(), INTERNAL_AUDIO_KEY_HEADER),
     }))
 }
 
@@ -747,6 +784,115 @@ fn encode_with_onnx_runtime_streaming(
     Ok(encoded)
 }
 
+fn encode_streamed_pcm_with_onnx_runtime(
+    config: &AppConfig,
+    prepared: &PreparedRequestEnvelope,
+    input: std_mpsc::Receiver<Option<Bytes>>,
+    sender: mpsc::UnboundedSender<Bytes>,
+) -> Result<Vec<u8>> {
+    let runtime = load_onnx_runtime(config, prepared.quality)?;
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("encodec runtime mutex poisoned"))?;
+    let OnnxEncodeRuntime { frame, lm } = &mut *runtime;
+    let model_meta = frame.metadata().clone();
+
+    anyhow::ensure!(
+        prepared.descriptor.sample_rate as usize == model_meta.sample_rate,
+        "prepared PCM sample rate {} does not match bundle sample rate {}",
+        prepared.descriptor.sample_rate,
+        model_meta.sample_rate
+    );
+    anyhow::ensure!(
+        prepared.descriptor.channels as usize == model_meta.channels,
+        "prepared PCM channels {} do not match bundle channels {}",
+        prepared.descriptor.channels,
+        model_meta.channels
+    );
+    anyhow::ensure!(
+        prepared.descriptor.bits_per_sample == 16,
+        "encodec-api currently expects canonical s16le PCM, got {} bits",
+        prepared.descriptor.bits_per_sample
+    );
+
+    let bytes_per_frame = model_meta
+        .channels
+        .checked_mul(prepared.descriptor.bits_per_sample as usize / 8)
+        .ok_or_else(|| anyhow::anyhow!("invalid channel count"))?;
+    anyhow::ensure!(bytes_per_frame > 0, "invalid PCM frame width");
+
+    let mut encoded = Vec::new();
+    let mut buffered_chunks = Vec::new();
+    let mut pending_pcm = Vec::new();
+    let mut base_sample_offset = 0usize;
+    let mut next_segment_offset = 0usize;
+    let mut total_pcm_bytes = 0usize;
+
+    while let Ok(next) = input.recv() {
+        match next {
+            Some(chunk) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                pending_pcm.extend_from_slice(&chunk);
+                total_pcm_bytes += chunk.len();
+                anyhow::ensure!(
+                    total_pcm_bytes % bytes_per_frame == 0,
+                    "prepared PCM stream length {} is not aligned to {} bytes/frame",
+                    total_pcm_bytes,
+                    bytes_per_frame
+                );
+                pump_ready_segment_batches(
+                    frame,
+                    Some(lm),
+                    &model_meta,
+                    config.encodec_frame_batch_size,
+                    &mut pending_pcm,
+                    &mut base_sample_offset,
+                    &mut next_segment_offset,
+                    total_pcm_bytes / bytes_per_frame,
+                    false,
+                    |bytes| {
+                        buffered_chunks.extend_from_slice(bytes);
+                        Ok(())
+                    },
+                )?;
+            }
+            None => break,
+        }
+    }
+
+    anyhow::ensure!(total_pcm_bytes > 0, "prepared PCM stream was empty");
+    let total_samples = total_pcm_bytes / bytes_per_frame;
+    let header = encode_ecdc_header_with_options(frame, total_samples, None, true, false)?;
+    encoded.extend_from_slice(&header);
+    let _ = sender.send(Bytes::from(header));
+
+    if !buffered_chunks.is_empty() {
+        encoded.extend_from_slice(&buffered_chunks);
+        let _ = sender.send(Bytes::from(buffered_chunks));
+    }
+
+    pump_ready_segment_batches(
+        frame,
+        Some(lm),
+        &model_meta,
+        config.encodec_frame_batch_size,
+        &mut pending_pcm,
+        &mut base_sample_offset,
+        &mut next_segment_offset,
+        total_samples,
+        true,
+        |bytes| {
+            encoded.extend_from_slice(bytes);
+            let _ = sender.send(Bytes::copy_from_slice(bytes));
+            Ok(())
+        },
+    )?;
+
+    Ok(encoded)
+}
+
 async fn run_encodec(config: &AppConfig, prepared: &PreparedEncodeProgram) -> Result<Bytes> {
     let config = config.clone();
     let prepared = prepared.clone();
@@ -769,7 +915,43 @@ pub fn start_streaming_encodec(
     StreamingEncodeHandle { chunks, join }
 }
 
+pub fn start_incremental_streaming_encodec(
+    config: &AppConfig,
+    prepared: &PreparedRequestEnvelope,
+) -> IncrementalStreamingEncodeHandle {
+    let config = config.clone();
+    let prepared = prepared.clone();
+    let (sender, chunks) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = std_mpsc::channel();
+    let join = tokio::task::spawn_blocking(move || {
+        encode_streamed_pcm_with_onnx_runtime(&config, &prepared, input_rx, sender).map(Bytes::from)
+    });
+    IncrementalStreamingEncodeHandle {
+        chunks,
+        input: input_tx,
+        join,
+    }
+}
+
 impl StreamingEncodeHandle {
+    pub async fn finish(self) -> Result<Bytes> {
+        self.join.await.context("encodec worker task panicked")?
+    }
+}
+
+impl IncrementalStreamingEncodeHandle {
+    pub fn send_pcm_chunk(&self, chunk: Bytes) -> Result<()> {
+        self.input
+            .send(Some(chunk))
+            .map_err(|_| anyhow::anyhow!("incremental encode input channel closed"))
+    }
+
+    pub fn finish_input(&self) -> Result<()> {
+        self.input
+            .send(None)
+            .map_err(|_| anyhow::anyhow!("incremental encode input channel closed"))
+    }
+
     pub async fn finish(self) -> Result<Bytes> {
         self.join.await.context("encodec worker task panicked")?
     }
@@ -964,7 +1146,7 @@ pub fn program_pcm_descriptor() -> CachedPcmDescriptor {
     )
 }
 
-fn pcm_duration_seconds(
+pub(crate) fn pcm_duration_seconds(
     bytes_len: usize,
     sample_rate: u32,
     channels: u8,
@@ -977,6 +1159,24 @@ fn pcm_duration_seconds(
     (bytes_len / bytes_per_frame) as f64 / sample_rate as f64
 }
 
+pub(crate) fn finalize_prepared_audio_key_digest(
+    mut digest: Sha256,
+    descriptor: &CachedPcmDescriptor,
+    quality: EncodeQuality,
+    track_count: usize,
+    gap_seconds: f64,
+    total_gap_seconds: f64,
+) -> String {
+    digest.update(format!("quality={}", quality.as_str()).as_bytes());
+    digest.update(format!("tracks={track_count}").as_bytes());
+    digest.update(format!("gap={gap_seconds:.6}").as_bytes());
+    digest.update(format!("total_gap={total_gap_seconds:.6}").as_bytes());
+    digest.update(format!("rate={}", descriptor.sample_rate).as_bytes());
+    digest.update(format!("channels={}", descriptor.channels).as_bytes());
+    digest.update(format!("bits={}", descriptor.bits_per_sample).as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 fn derive_prepared_audio_key(
     body: &[u8],
     descriptor: &CachedPcmDescriptor,
@@ -987,14 +1187,131 @@ fn derive_prepared_audio_key(
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(body);
-    digest.update(format!("quality={}", quality.as_str()).as_bytes());
-    digest.update(format!("tracks={track_count}").as_bytes());
-    digest.update(format!("gap={gap_seconds:.6}").as_bytes());
-    digest.update(format!("total_gap={total_gap_seconds:.6}").as_bytes());
-    digest.update(format!("rate={}", descriptor.sample_rate).as_bytes());
-    digest.update(format!("channels={}", descriptor.channels).as_bytes());
-    digest.update(format!("bits={}", descriptor.bits_per_sample).as_bytes());
-    format!("{:x}", digest.finalize())
+    finalize_prepared_audio_key_digest(
+        digest,
+        descriptor,
+        quality,
+        track_count,
+        gap_seconds,
+        total_gap_seconds,
+    )
+}
+
+fn pump_ready_segment_batches(
+    frame: &mut OnnxFrameCodec,
+    lm: Option<&mut OnnxLmCodec>,
+    model_meta: &OnnxFrameBundleMetadata,
+    batch_size: usize,
+    pending_pcm: &mut Vec<u8>,
+    base_sample_offset: &mut usize,
+    next_segment_offset: &mut usize,
+    total_samples_available: usize,
+    finalize: bool,
+    mut emit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let stride = model_meta.segment_stride.max(1);
+    let bytes_per_frame = model_meta.channels * 2;
+    let batch_size = batch_size.max(1);
+    let mut lm = lm;
+
+    loop {
+        let mut offsets = Vec::with_capacity(batch_size);
+        let mut offset = *next_segment_offset;
+        while offsets.len() < batch_size {
+            if finalize {
+                if offset >= total_samples_available {
+                    break;
+                }
+            } else if offset + model_meta.segment_samples > total_samples_available {
+                break;
+            }
+            offsets.push(offset);
+            offset += stride;
+        }
+
+        if offsets.is_empty() {
+            break;
+        }
+
+        let (frame_lengths, batch) = build_pcm_segment_batch(
+            pending_pcm,
+            *base_sample_offset,
+            &offsets,
+            total_samples_available,
+            model_meta,
+        )?;
+        encode_ecdc_segment_batch_with_options(
+            frame,
+            lm.as_deref_mut(),
+            &batch,
+            &frame_lengths,
+            false,
+            &mut emit,
+        )?;
+
+        *next_segment_offset = offsets.last().copied().unwrap_or(*next_segment_offset) + stride;
+        let drop_samples = (*next_segment_offset).saturating_sub(*base_sample_offset);
+        let drop_bytes = drop_samples.saturating_mul(bytes_per_frame);
+        if drop_bytes > 0 && drop_bytes <= pending_pcm.len() {
+            pending_pcm.drain(..drop_bytes);
+            *base_sample_offset += drop_samples;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_pcm_segment_batch(
+    pending_pcm: &[u8],
+    base_sample_offset: usize,
+    offsets: &[usize],
+    total_samples_available: usize,
+    model_meta: &OnnxFrameBundleMetadata,
+) -> Result<(Vec<usize>, Array3<f32>)> {
+    let bytes_per_frame = model_meta.channels * 2;
+    anyhow::ensure!(
+        pending_pcm.len() % bytes_per_frame == 0,
+        "prepared PCM length {} is not aligned to {} bytes/frame",
+        pending_pcm.len(),
+        bytes_per_frame
+    );
+
+    let mut frame_lengths = Vec::with_capacity(offsets.len());
+    let mut batch = Array3::<f32>::zeros((
+        offsets.len(),
+        model_meta.channels,
+        model_meta.segment_samples,
+    ));
+    for (batch_index, offset) in offsets.iter().copied().enumerate() {
+        anyhow::ensure!(
+            offset >= base_sample_offset,
+            "segment offset {} precedes base sample offset {}",
+            offset,
+            base_sample_offset
+        );
+        let relative_offset = offset - base_sample_offset;
+        let copy_len = total_samples_available
+            .saturating_sub(offset)
+            .min(model_meta.segment_samples);
+        anyhow::ensure!(copy_len > 0, "cannot build empty segment batch");
+        let frame_length =
+            (copy_len * model_meta.frame_length).div_ceil(model_meta.segment_samples);
+        frame_lengths.push(frame_length);
+        for sample_index in 0..copy_len {
+            let frame_base = (relative_offset + sample_index) * bytes_per_frame;
+            anyhow::ensure!(
+                frame_base + bytes_per_frame <= pending_pcm.len(),
+                "segment batch requested PCM beyond buffered range"
+            );
+            for channel in 0..model_meta.channels {
+                let offset = frame_base + channel * 2;
+                let sample = i16::from_le_bytes([pending_pcm[offset], pending_pcm[offset + 1]]);
+                batch[[batch_index, channel, sample_index]] = sample as f32 / 32768.0;
+            }
+        }
+    }
+
+    Ok((frame_lengths, batch))
 }
 
 #[cfg(test)]
