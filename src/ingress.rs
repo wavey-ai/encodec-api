@@ -19,9 +19,11 @@ use web_service::{
 
 use crate::config::AppConfig;
 use crate::encode::{
-    apply_prepared_request_headers, client_error, parse_request, prepare_request_program,
-    PreparedEncodeProgram,
+    apply_prepared_request_headers, apply_prepared_request_metadata_headers, client_error,
+    parse_request, prepare_request_program, program_pcm_descriptor, request_encode_options,
+    request_filename, PreparedEncodeProgram, PreparedRequestMetadata,
 };
+use soundkit_decoder::{DecodeError, DecodeOptions, DecodePipeline, DecodePipelineHandle};
 
 #[derive(Clone)]
 pub struct EncodeIngress {
@@ -70,11 +72,6 @@ impl EncodeIngress {
         stream_writer: Box<dyn StreamWriter>,
     ) -> HandlerResult<()> {
         reject_json_requests(&req).map_err(anyhow_to_server_error)?;
-        let prepared = self
-            .prepare_request_body(&req, body)
-            .await
-            .map_err(anyhow_to_server_error)?;
-
         let guard = self
             .cached
             .open_streaming_request()
@@ -82,9 +79,10 @@ impl EncodeIngress {
             .map_err(anyhow_to_server_error)?;
         let stream_id = guard.stream_id();
 
-        self.cache_prepared_request(stream_id, &req, &prepared, true)
-            .await
-            .map_err(anyhow_to_server_error)?;
+        if let Err(error) = self.cache_request_body(stream_id, &req, body, true).await {
+            guard.close().await;
+            return Err(anyhow_to_server_error(error));
+        }
 
         let proxy_result = self
             .cached
@@ -141,9 +139,13 @@ impl EncodeIngress {
             .map_err(anyhow_to_server_error)?;
         let stream_id = upload_stream.stream_id();
 
-        self.cache_prepared_request(stream_id, &req, &prepared, true)
+        if let Err(error) = self
+            .cache_prepared_request(stream_id, &req, &prepared, true)
             .await
-            .map_err(anyhow_to_server_error)?;
+        {
+            upload_stream.close().await;
+            return Err(anyhow_to_server_error(error));
+        }
         let proxy_result = self.proxy_websocket_response(stream_id, sink).await;
         upload_stream.close().await;
         proxy_result
@@ -155,13 +157,11 @@ impl EncodeIngress {
         body: BodyStream,
     ) -> Result<HandlerResponse> {
         reject_json_requests(&req)?;
-        let prepared = self.prepare_request_body(&req, body).await?;
-
         let mut guard = self.cached.open_buffered_request().await?;
         let stream_id = guard.stream_id();
 
         let result = async {
-            self.cache_prepared_request(stream_id, &req, &prepared, false)
+            self.cache_request_body(stream_id, &req, body, false)
                 .await?;
 
             let rx = guard
@@ -173,6 +173,23 @@ impl EncodeIngress {
 
         guard.close().await;
         result
+    }
+
+    async fn cache_request_body(
+        &self,
+        stream_id: u64,
+        req: &Request<()>,
+        body: BodyStream,
+        streaming: bool,
+    ) -> Result<()> {
+        if request_supports_stream_decode(req) {
+            self.cache_streamed_direct_request(stream_id, req, body, streaming)
+                .await
+        } else {
+            let prepared = self.prepare_request_body(req, body).await?;
+            self.cache_prepared_request(stream_id, req, &prepared, streaming)
+                .await
+        }
     }
 
     async fn write_cached_request_headers(
@@ -205,6 +222,74 @@ impl EncodeIngress {
                 self.config.upload_response_config().slot_bytes().max(1),
             )
             .await?;
+        self.cached.end_request(stream_id).await
+    }
+
+    async fn cache_streamed_direct_request(
+        &self,
+        stream_id: u64,
+        req: &Request<()>,
+        mut body: BodyStream,
+        streaming: bool,
+    ) -> Result<()> {
+        let (quality, gap_seconds) = request_encode_options(req)?;
+        let descriptor = program_pcm_descriptor();
+        self.cached
+            .write_request_headers_with(stream_id, req, |headers| {
+                apply_prepared_request_metadata_headers(
+                    headers,
+                    PreparedRequestMetadata {
+                        sample_rate: descriptor.sample_rate,
+                        channels: descriptor.channels,
+                        bits_per_sample: descriptor.bits_per_sample,
+                        quality,
+                        track_count: 1,
+                        gap_seconds,
+                        total_gap_seconds: 0.0,
+                        duration_seconds: None,
+                        audio_key: None,
+                        streaming,
+                    },
+                )
+            })
+            .await?;
+
+        let mut pipeline = DecodePipeline::spawn_with_buffers_and_options(
+            1024,
+            1024,
+            DecodeOptions {
+                output_bits_per_sample: Some(descriptor.bits_per_sample),
+                output_sample_rate: Some(descriptor.sample_rate),
+                output_channels: Some(descriptor.channels),
+            },
+        );
+        let mut decoded_body_bytes = 0usize;
+
+        while let Some(next) = body.next().await {
+            let chunk =
+                next.map_err(|error| anyhow::anyhow!("failed to read request body: {error}"))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            self.send_decoder_chunk(stream_id, &mut pipeline, chunk, &mut decoded_body_bytes)
+                .await?;
+        }
+
+        self.send_decoder_chunk(
+            stream_id,
+            &mut pipeline,
+            Bytes::new(),
+            &mut decoded_body_bytes,
+        )
+        .await?;
+        self.flush_decoder_outputs(stream_id, &mut pipeline, &mut decoded_body_bytes)
+            .await?;
+
+        anyhow::ensure!(
+            decoded_body_bytes > 0,
+            "request body did not include decodable audio"
+        );
+
         self.cached.end_request(stream_id).await
     }
 
@@ -307,6 +392,83 @@ impl EncodeIngress {
         .await
         .map_err(|_| ServerError::Config("response timeout".into()))?
     }
+
+    async fn send_decoder_chunk(
+        &self,
+        stream_id: u64,
+        pipeline: &mut DecodePipelineHandle,
+        chunk: Bytes,
+        decoded_body_bytes: &mut usize,
+    ) -> Result<()> {
+        loop {
+            match pipeline.send(chunk.clone()) {
+                Ok(()) => {
+                    self.drain_decoder_outputs(stream_id, pipeline, decoded_body_bytes)
+                        .await?;
+                    return Ok(());
+                }
+                Err(DecodeError::InputBufferFull) => {
+                    self.drain_decoder_outputs(stream_id, pipeline, decoded_body_bytes)
+                        .await?;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!("decoder input failed: {error}"));
+                }
+            }
+        }
+    }
+
+    async fn drain_decoder_outputs(
+        &self,
+        stream_id: u64,
+        pipeline: &mut DecodePipelineHandle,
+        decoded_body_bytes: &mut usize,
+    ) -> Result<()> {
+        let chunk_size = self.config.upload_response_config().slot_bytes().max(1);
+        while let Some(output) = pipeline.try_recv() {
+            let audio = match output {
+                Ok(audio) => audio,
+                Err(error) => return Err(anyhow::anyhow!("audio decode failed: {error}")),
+            };
+            *decoded_body_bytes += audio.data().len();
+            self.cached
+                .append_request_body_sliced(stream_id, audio.data(), chunk_size)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_decoder_outputs(
+        &self,
+        stream_id: u64,
+        pipeline: &mut DecodePipelineHandle,
+        decoded_body_bytes: &mut usize,
+    ) -> Result<()> {
+        loop {
+            self.drain_decoder_outputs(stream_id, pipeline, decoded_body_bytes)
+                .await?;
+            match tokio::task::block_in_place(|| pipeline.recv()) {
+                Some(output) => {
+                    let audio = match output {
+                        Ok(audio) => audio,
+                        Err(error) => {
+                            return Err(anyhow::anyhow!("audio decode failed: {error}"));
+                        }
+                    };
+                    *decoded_body_bytes += audio.data().len();
+                    self.cached
+                        .append_request_body_sliced(
+                            stream_id,
+                            audio.data(),
+                            self.config.upload_response_config().slot_bytes().max(1),
+                        )
+                        .await?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
 }
 
 impl EncodeIngressWebSocketHandler {
@@ -370,6 +532,61 @@ fn reject_json_requests(req: &Request<()>) -> Result<()> {
     Ok(())
 }
 
+fn request_supports_stream_decode(req: &Request<()>) -> bool {
+    let content_type = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase());
+
+    if content_type
+        .as_deref()
+        .map(|value| value.starts_with("multipart/"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    if content_type
+        .as_deref()
+        .map(is_streamable_audio_content_type)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let filename = request_filename(req);
+    filename
+        .rsplit_once('.')
+        .map(|(_, extension)| is_streamable_audio_extension(extension))
+        .unwrap_or(false)
+}
+
+fn is_streamable_audio_content_type(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "audio/mpeg"
+            | "audio/wav"
+            | "audio/x-wav"
+            | "audio/wave"
+            | "audio/flac"
+            | "audio/mp4"
+            | "audio/x-m4a"
+            | "audio/aac"
+            | "audio/ogg"
+            | "audio/opus"
+            | "audio/webm"
+            | "video/webm"
+    )
+}
+
+fn is_streamable_audio_extension(extension: &str) -> bool {
+    matches!(
+        extension.trim().to_ascii_lowercase().as_str(),
+        "mp3" | "wav" | "wave" | "flac" | "m4a" | "mp4" | "aac" | "ogg" | "oga" | "opus" | "webm"
+    )
+}
+
 fn error_response(status: StatusCode, message: String) -> HandlerResponse {
     HandlerResponse {
         status,
@@ -406,4 +623,51 @@ async fn collect_body(mut body: BodyStream) -> Result<Bytes> {
         buffer.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buffer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Request;
+
+    #[test]
+    fn stream_decode_supports_known_direct_audio_types() {
+        let wav = Request::builder()
+            .uri("/encode")
+            .header(CONTENT_TYPE, "audio/wav")
+            .body(())
+            .unwrap();
+        assert!(request_supports_stream_decode(&wav));
+
+        let mp3 = Request::builder()
+            .uri("/encode")
+            .header("x-filename", "clip.mp3")
+            .body(())
+            .unwrap();
+        assert!(request_supports_stream_decode(&mp3));
+
+        let webm = Request::builder()
+            .uri("/encode")
+            .header(CONTENT_TYPE, "video/webm")
+            .body(())
+            .unwrap();
+        assert!(request_supports_stream_decode(&webm));
+    }
+
+    #[test]
+    fn stream_decode_rejects_multipart_and_unknown_types() {
+        let multipart = Request::builder()
+            .uri("/encode")
+            .header(CONTENT_TYPE, "multipart/form-data; boundary=abc123")
+            .body(())
+            .unwrap();
+        assert!(!request_supports_stream_decode(&multipart));
+
+        let unknown = Request::builder()
+            .uri("/encode")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(())
+            .unwrap();
+        assert!(!request_supports_stream_decode(&unknown));
+    }
 }

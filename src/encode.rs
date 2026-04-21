@@ -4,7 +4,10 @@ use av_api::cached_audio::{
     apply_cached_pcm_descriptor_headers, cached_pcm_descriptor_from_headers, CachedPcmDescriptor,
     CachedPcmFormat, PCM_FORMAT_HEADER,
 };
-use av_api::program_audio::{prepare_audio_program, UploadedAudioFile};
+use av_api::program_audio::{
+    prepare_audio_program, UploadedAudioFile, PROGRAM_BITS_PER_SAMPLE, PROGRAM_CHANNELS,
+    PROGRAM_SAMPLE_RATE,
+};
 use bytes::Bytes;
 use encodec_rs::ecdc::{
     encode_audio_to_ecdc_stream_with_options, encode_audio_to_ecdc_with_options,
@@ -124,6 +127,20 @@ pub struct PreparedEncodeProgram {
     pub track_count: usize,
     pub gap_seconds: f64,
     pub total_gap_seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedRequestMetadata<'a> {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub bits_per_sample: u8,
+    pub quality: EncodeQuality,
+    pub track_count: usize,
+    pub gap_seconds: f64,
+    pub total_gap_seconds: f64,
+    pub duration_seconds: Option<f64>,
+    pub audio_key: Option<&'a str>,
+    pub streaming: bool,
 }
 
 pub struct StreamingEncodeHandle {
@@ -249,6 +266,27 @@ pub fn apply_prepared_request_headers(
     prepared: &PreparedEncodeProgram,
     streaming: bool,
 ) -> Result<()> {
+    apply_prepared_request_metadata_headers(
+        headers,
+        PreparedRequestMetadata {
+            sample_rate: prepared.sample_rate,
+            channels: prepared.channels,
+            bits_per_sample: prepared.bits_per_sample,
+            quality: prepared.quality,
+            track_count: prepared.track_count,
+            gap_seconds: prepared.gap_seconds,
+            total_gap_seconds: prepared.total_gap_seconds,
+            duration_seconds: Some(prepared.duration_seconds),
+            audio_key: Some(prepared.audio_key.as_str()),
+            streaming,
+        },
+    )
+}
+
+pub fn apply_prepared_request_metadata_headers(
+    headers: &mut HeaderMap,
+    prepared: PreparedRequestMetadata<'_>,
+) -> Result<()> {
     headers.remove(CONTENT_LENGTH);
     headers.insert(
         CONTENT_TYPE,
@@ -286,18 +324,26 @@ pub fn apply_prepared_request_headers(
         INTERNAL_TOTAL_GAP_SECONDS_HEADER,
         prepared.total_gap_seconds.to_string(),
     )?;
-    insert_header(
-        headers,
-        INTERNAL_DURATION_SECONDS_HEADER,
-        prepared.duration_seconds.to_string(),
-    )?;
-    insert_header(
-        headers,
-        INTERNAL_AUDIO_KEY_HEADER,
-        prepared.audio_key.clone(),
-    )?;
+    match prepared.duration_seconds {
+        Some(duration_seconds) => insert_header(
+            headers,
+            INTERNAL_DURATION_SECONDS_HEADER,
+            duration_seconds.to_string(),
+        )?,
+        None => {
+            headers.remove(INTERNAL_DURATION_SECONDS_HEADER);
+        }
+    }
+    match prepared.audio_key {
+        Some(audio_key) => {
+            insert_header(headers, INTERNAL_AUDIO_KEY_HEADER, audio_key.to_string())?;
+        }
+        None => {
+            headers.remove(INTERNAL_AUDIO_KEY_HEADER);
+        }
+    }
 
-    if streaming {
+    if prepared.streaming {
         headers.insert(
             INTERNAL_STREAMING_MODE_HEADER,
             HeaderValue::from_static(INTERNAL_STREAMING_MODE_JSONL),
@@ -328,14 +374,33 @@ pub fn prepared_program_from_internal_request(
     let gap_seconds = parse_required_header::<f64>(request.headers(), INTERNAL_GAP_SECONDS_HEADER)?;
     let total_gap_seconds =
         parse_required_header::<f64>(request.headers(), INTERNAL_TOTAL_GAP_SECONDS_HEADER)?;
-    let duration_seconds =
-        parse_required_header::<f64>(request.headers(), INTERNAL_DURATION_SECONDS_HEADER)?;
-    let audio_key = required_header(request.headers(), INTERNAL_AUDIO_KEY_HEADER)?.to_string();
 
     anyhow::ensure!(
         !body.is_empty(),
         "prepared internal request body did not include PCM bytes"
     );
+
+    let duration_seconds =
+        optional_parsed_header::<f64>(request.headers(), INTERNAL_DURATION_SECONDS_HEADER)?
+            .unwrap_or_else(|| {
+                pcm_duration_seconds(
+                    body.len(),
+                    descriptor.sample_rate,
+                    descriptor.channels,
+                    descriptor.bits_per_sample,
+                )
+            });
+    let audio_key =
+        optional_header(request.headers(), INTERNAL_AUDIO_KEY_HEADER).unwrap_or_else(|| {
+            derive_prepared_audio_key(
+                body,
+                &descriptor,
+                quality,
+                track_count,
+                gap_seconds,
+                total_gap_seconds,
+            )
+        });
 
     Ok(Some(PreparedEncodeProgram {
         pcm_bytes: body.to_vec(),
@@ -451,6 +516,16 @@ pub async fn parse_request(req: &Request<()>, body: Bytes) -> Result<ParsedEncod
         quality,
         audio_key,
     })
+}
+
+pub fn request_encode_options(req: &Request<()>) -> Result<(EncodeQuality, f64)> {
+    let gap_seconds = query_param(req, "gap_seconds")
+        .as_deref()
+        .map(parse_gap_seconds)
+        .transpose()?
+        .unwrap_or(DEFAULT_TRACK_GAP_SECONDS);
+    let quality = EncodeQuality::parse(query_param(req, "quality").as_deref())?;
+    Ok((quality, gap_seconds))
 }
 
 pub fn response_headers(artifacts: &EncodeArtifacts) -> Vec<(String, String)> {
@@ -765,7 +840,7 @@ pub fn prepare_request_program(parsed: ParsedEncodeRequest) -> Result<PreparedEn
     })
 }
 
-fn request_filename(req: &Request<()>) -> String {
+pub(crate) fn request_filename(req: &Request<()>) -> String {
     if let Some(value) = req
         .headers()
         .get("x-filename")
@@ -831,6 +906,13 @@ fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing header {name}"))
 }
 
+fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
 fn parse_required_header<T>(headers: &HeaderMap, name: &str) -> Result<T>
 where
     T: std::str::FromStr,
@@ -839,6 +921,20 @@ where
     required_header(headers, name)?
         .parse::<T>()
         .map_err(|error| anyhow::anyhow!("invalid {name} header: {error}"))
+}
+
+fn optional_parsed_header<T>(headers: &HeaderMap, name: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    optional_header(headers, name)
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|error| anyhow::anyhow!("invalid {name} header: {error}"))
+        })
+        .transpose()
 }
 
 async fn emit_progress(
@@ -857,6 +953,48 @@ fn round_one(value: f64) -> f64 {
 
 fn round_two(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
+}
+
+pub fn program_pcm_descriptor() -> CachedPcmDescriptor {
+    CachedPcmDescriptor::new(
+        CachedPcmFormat::S16LeInterleaved,
+        PROGRAM_SAMPLE_RATE,
+        PROGRAM_CHANNELS,
+        PROGRAM_BITS_PER_SAMPLE,
+    )
+}
+
+fn pcm_duration_seconds(
+    bytes_len: usize,
+    sample_rate: u32,
+    channels: u8,
+    bits_per_sample: u8,
+) -> f64 {
+    let bytes_per_frame = (channels as usize) * (bits_per_sample as usize / 8);
+    if bytes_per_frame == 0 || sample_rate == 0 {
+        return 0.0;
+    }
+    (bytes_len / bytes_per_frame) as f64 / sample_rate as f64
+}
+
+fn derive_prepared_audio_key(
+    body: &[u8],
+    descriptor: &CachedPcmDescriptor,
+    quality: EncodeQuality,
+    track_count: usize,
+    gap_seconds: f64,
+    total_gap_seconds: f64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(body);
+    digest.update(format!("quality={}", quality.as_str()).as_bytes());
+    digest.update(format!("tracks={track_count}").as_bytes());
+    digest.update(format!("gap={gap_seconds:.6}").as_bytes());
+    digest.update(format!("total_gap={total_gap_seconds:.6}").as_bytes());
+    digest.update(format!("rate={}", descriptor.sample_rate).as_bytes());
+    digest.update(format!("channels={}", descriptor.channels).as_bytes());
+    digest.update(format!("bits={}", descriptor.bits_per_sample).as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -930,5 +1068,35 @@ mod tests {
         assert_eq!(decoded.track_count, prepared.track_count);
         assert_eq!(decoded.gap_seconds, prepared.gap_seconds);
         assert_eq!(decoded.total_gap_seconds, prepared.total_gap_seconds);
+    }
+
+    #[test]
+    fn prepared_internal_headers_derive_missing_fields() {
+        let pcm_bytes = vec![0_u8; 48_000 * 2 * 2];
+        let mut request = Request::builder().uri("/encode").body(()).unwrap();
+        apply_prepared_request_metadata_headers(
+            request.headers_mut(),
+            PreparedRequestMetadata {
+                sample_rate: 48_000,
+                channels: 2,
+                bits_per_sample: 16,
+                quality: EncodeQuality::Standard,
+                track_count: 1,
+                gap_seconds: 0.0,
+                total_gap_seconds: 0.0,
+                duration_seconds: None,
+                audio_key: None,
+                streaming: false,
+            },
+        )
+        .unwrap();
+
+        let decoded = prepared_program_from_internal_request(&request, &pcm_bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.duration_seconds, 1.0);
+        assert!(!decoded.audio_key.is_empty());
+        assert_eq!(decoded.quality, EncodeQuality::Standard);
+        assert_eq!(decoded.track_count, 1);
     }
 }
