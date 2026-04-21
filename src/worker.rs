@@ -18,9 +18,10 @@ use web_service::HandlerResponse;
 
 use crate::config::AppConfig;
 use crate::encode::{
-    headers_to_json, parse_request, prepared_program_from_internal_request, process_parsed_request,
-    process_prepared_program, process_request, response_headers, stream_artifact_selection,
-    EncodeArtifacts, ProgressSink, StreamArtifactSelection,
+    build_artifacts_from_ecdc, headers_to_json, parse_request,
+    prepared_program_from_internal_request, process_parsed_request, process_prepared_program,
+    process_request, response_headers, start_streaming_encodec, stream_artifact_selection,
+    EncodeArtifacts, PreparedEncodeProgram, ProgressSink, StreamArtifactSelection,
 };
 use crate::protocol::{INTERNAL_STREAMING_MODE_HEADER, INTERNAL_STREAMING_MODE_JSONL};
 
@@ -301,37 +302,44 @@ impl WorkerState {
         let body = self
             .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
             .await?;
-        let artifacts =
-            if let Some(prepared) = prepared_program_from_internal_request(&request, &body)? {
-                writer
-                    .send_value(json!({
-                        "type": "Request",
-                        "request_id": request_id.as_str(),
-                        "track_count": prepared.track_count,
-                        "quality": prepared.quality.as_str(),
-                        "gap_seconds": prepared.gap_seconds,
-                        "audio_key": prepared.audio_key.as_str(),
-                    }))
-                    .await?;
-                let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
-                process_prepared_program(&self.config, prepared, &mut progress).await?
-            } else {
-                let parsed = parse_request(&request, body).await?;
-                writer
-                    .send_value(json!({
-                        "type": "Request",
-                        "request_id": request_id.as_str(),
-                        "track_count": parsed.files.len(),
-                        "quality": parsed.quality.as_str(),
-                        "gap_seconds": parsed.gap_seconds,
-                        "audio_key": parsed.audio_key.as_str(),
-                    }))
-                    .await?;
-                let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
-                process_parsed_request(&self.config, parsed, &mut progress).await?
-            };
-        self.send_stream_artifacts(writer, &request_id, artifact_selection, &artifacts)
-            .await?;
+        let artifacts = if let Some(prepared) =
+            prepared_program_from_internal_request(&request, &body)?
+        {
+            writer
+                .send_value(json!({
+                    "type": "Request",
+                    "request_id": request_id.as_str(),
+                    "track_count": prepared.track_count,
+                    "quality": prepared.quality.as_str(),
+                    "gap_seconds": prepared.gap_seconds,
+                    "audio_key": prepared.audio_key.as_str(),
+                }))
+                .await?;
+            self.process_streaming_prepared_upload(
+                request_id.as_str(),
+                artifact_selection,
+                prepared,
+                writer,
+            )
+            .await?
+        } else {
+            let parsed = parse_request(&request, body).await?;
+            writer
+                .send_value(json!({
+                    "type": "Request",
+                    "request_id": request_id.as_str(),
+                    "track_count": parsed.files.len(),
+                    "quality": parsed.quality.as_str(),
+                    "gap_seconds": parsed.gap_seconds,
+                    "audio_key": parsed.audio_key.as_str(),
+                }))
+                .await?;
+            let mut progress: Option<&mut (dyn ProgressSink + Send)> = Some(writer);
+            let artifacts = process_parsed_request(&self.config, parsed, &mut progress).await?;
+            self.send_stream_artifacts(writer, request_id.as_str(), artifact_selection, &artifacts)
+                .await?;
+            artifacts
+        };
         writer
             .send_value(json!({
                 "type": "Done",
@@ -454,6 +462,99 @@ impl WorkerState {
         Ok(Bytes::from(buffer))
     }
 
+    async fn process_streaming_prepared_upload(
+        &self,
+        request_id: &str,
+        selection: StreamArtifactSelection,
+        prepared: PreparedEncodeProgram,
+        writer: &mut JsonLineResponseWriter,
+    ) -> Result<EncodeArtifacts> {
+        writer
+            .send_value(json!({
+                "type": "Progress",
+                "status": "loading",
+                "msg": "Prepared canonical stereo PCM",
+                "duration": round_one(prepared.duration_seconds),
+            }))
+            .await?;
+        writer
+            .send_value(json!({
+                "type": "Progress",
+                "status": "encoding",
+                "msg": "Encoding with EnCodec...",
+                "duration": round_one(prepared.duration_seconds),
+                "bandwidthKbps": prepared.quality.bandwidth_kbps(),
+            }))
+            .await?;
+
+        let mut handle = start_streaming_encodec(&self.config, &prepared);
+        let mut artifact_chunks = 0usize;
+        let mut pending_ecdc = Vec::new();
+
+        if selection.includes_ecdc() {
+            send_artifact_start(writer, request_id, "ecdc", "application/octet-stream", None)
+                .await?;
+        }
+
+        while let Some(chunk) = handle.chunks.recv().await {
+            if !selection.includes_ecdc() {
+                continue;
+            }
+            pending_ecdc.extend_from_slice(&chunk);
+            while pending_ecdc.len() >= STREAM_ARTIFACT_CHUNK_BYTES {
+                let remainder = pending_ecdc.split_off(STREAM_ARTIFACT_CHUNK_BYTES);
+                artifact_chunks += 1;
+                send_artifact_chunk(
+                    writer,
+                    request_id,
+                    "ecdc",
+                    artifact_chunks - 1,
+                    &pending_ecdc,
+                )
+                .await?;
+                pending_ecdc = remainder;
+            }
+        }
+
+        let ecdc = handle.finish().await?;
+
+        if selection.includes_ecdc() {
+            if !pending_ecdc.is_empty() {
+                artifact_chunks += 1;
+                send_artifact_chunk(
+                    writer,
+                    request_id,
+                    "ecdc",
+                    artifact_chunks - 1,
+                    &pending_ecdc,
+                )
+                .await?;
+            }
+            send_artifact_end(
+                writer,
+                request_id,
+                "ecdc",
+                artifact_chunks,
+                Some(ecdc.len()),
+            )
+            .await?;
+        }
+
+        writer
+            .send_value(json!({
+                "type": "Progress",
+                "status": "packing",
+                "msg": "Packing bytes to RGB...",
+            }))
+            .await?;
+
+        let artifacts = build_artifacts_from_ecdc(&self.config, &prepared, ecdc)?;
+        if selection.includes_png() {
+            send_artifact_chunks(writer, request_id, "png", "image/png", &artifacts.png).await?;
+        }
+        Ok(artifacts)
+    }
+
     async fn send_stream_artifacts(
         &self,
         writer: &mut JsonLineResponseWriter,
@@ -543,41 +644,76 @@ async fn send_artifact_chunks(
     content_type: &str,
     bytes: &[u8],
 ) -> Result<()> {
-    writer
-        .send_value(json!({
-            "type": "ArtifactStart",
-            "request_id": request_id,
-            "name": name,
-            "content_type": content_type,
-            "encoding": "base64",
-            "size_bytes": bytes.len(),
-        }))
-        .await?;
+    send_artifact_start(writer, request_id, name, content_type, Some(bytes.len())).await?;
 
     let mut chunks = 0usize;
     for (index, chunk) in bytes.chunks(STREAM_ARTIFACT_CHUNK_BYTES).enumerate() {
         chunks = index + 1;
-        writer
-            .send_value(json!({
-                "type": "ArtifactChunk",
-                "request_id": request_id,
-                "name": name,
-                "index": index,
-                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
-            }))
-            .await?;
+        send_artifact_chunk(writer, request_id, name, index, chunk).await?;
     }
 
-    writer
-        .send_value(json!({
-            "type": "ArtifactEnd",
-            "request_id": request_id,
-            "name": name,
-            "chunks": chunks,
-        }))
-        .await?;
+    send_artifact_end(writer, request_id, name, chunks, Some(bytes.len())).await?;
 
     Ok(())
+}
+
+async fn send_artifact_start(
+    writer: &mut JsonLineResponseWriter,
+    request_id: &str,
+    name: &str,
+    content_type: &str,
+    size_bytes: Option<usize>,
+) -> Result<()> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".into(), Value::String("ArtifactStart".into()));
+    payload.insert("request_id".into(), Value::String(request_id.into()));
+    payload.insert("name".into(), Value::String(name.into()));
+    payload.insert("content_type".into(), Value::String(content_type.into()));
+    payload.insert("encoding".into(), Value::String("base64".into()));
+    if let Some(size_bytes) = size_bytes {
+        payload.insert("size_bytes".into(), json!(size_bytes));
+    }
+    writer.send_value(Value::Object(payload)).await
+}
+
+async fn send_artifact_chunk(
+    writer: &mut JsonLineResponseWriter,
+    request_id: &str,
+    name: &str,
+    index: usize,
+    bytes: &[u8],
+) -> Result<()> {
+    writer
+        .send_value(json!({
+            "type": "ArtifactChunk",
+            "request_id": request_id,
+            "name": name,
+            "index": index,
+            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }))
+        .await
+}
+
+async fn send_artifact_end(
+    writer: &mut JsonLineResponseWriter,
+    request_id: &str,
+    name: &str,
+    chunks: usize,
+    size_bytes: Option<usize>,
+) -> Result<()> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("type".into(), Value::String("ArtifactEnd".into()));
+    payload.insert("request_id".into(), Value::String(request_id.into()));
+    payload.insert("name".into(), Value::String(name.into()));
+    payload.insert("chunks".into(), json!(chunks));
+    if let Some(size_bytes) = size_bytes {
+        payload.insert("size_bytes".into(), json!(size_bytes));
+    }
+    writer.send_value(Value::Object(payload)).await
+}
+
+fn round_one(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
 }
 
 fn is_streaming_request(req: &Request<()>) -> bool {

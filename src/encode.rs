@@ -6,7 +6,9 @@ use av_api::cached_audio::{
 };
 use av_api::program_audio::{prepare_audio_program, UploadedAudioFile};
 use bytes::Bytes;
-use encodec_rs::ecdc::encode_audio_to_ecdc_with_options;
+use encodec_rs::ecdc::{
+    encode_audio_to_ecdc_stream_with_options, encode_audio_to_ecdc_with_options,
+};
 use encodec_rs::onnx::{ExecutionTarget, OnnxFrameCodec, OnnxLmCodec};
 use futures_util::stream;
 use http::{
@@ -22,6 +24,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::task::JoinHandle;
 
 use crate::config::AppConfig;
 use crate::protocol::{
@@ -120,6 +124,11 @@ pub struct PreparedEncodeProgram {
     pub track_count: usize,
     pub gap_seconds: f64,
     pub total_gap_seconds: f64,
+}
+
+pub struct StreamingEncodeHandle {
+    pub chunks: UnboundedReceiver<Bytes>,
+    join: JoinHandle<Result<Bytes>>,
 }
 
 struct OnnxEncodeRuntime {
@@ -232,21 +241,7 @@ pub async fn process_prepared_program(
     )
     .await?;
 
-    let (png, png_side) = bytes_to_png(&ecdc)?;
-    let artifacts = EncodeArtifacts {
-        ecdc,
-        png,
-        png_side,
-        device_label: config.device_label(),
-        duration_seconds: prepared.duration_seconds,
-        quality: prepared.quality,
-        audio_key: prepared.audio_key,
-        track_count: prepared.track_count,
-        gap_seconds: prepared.gap_seconds,
-        total_gap_seconds: prepared.total_gap_seconds,
-    };
-
-    Ok(artifacts)
+    build_artifacts_from_ecdc(config, &prepared, ecdc)
 }
 
 pub fn apply_prepared_request_headers(
@@ -648,6 +643,35 @@ fn encode_with_onnx_runtime(
     )
 }
 
+fn encode_with_onnx_runtime_streaming(
+    config: &AppConfig,
+    prepared: &PreparedEncodeProgram,
+    sender: mpsc::UnboundedSender<Bytes>,
+) -> Result<Vec<u8>> {
+    let runtime = load_onnx_runtime(config, prepared.quality)?;
+    let mut runtime = runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("encodec runtime mutex poisoned"))?;
+    let OnnxEncodeRuntime { frame, lm } = &mut *runtime;
+    let meta = frame.metadata().clone();
+    let audio = prepared_pcm_to_audio(prepared, meta.channels, meta.sample_rate)?;
+    let mut encoded = Vec::new();
+    encode_audio_to_ecdc_stream_with_options(
+        frame,
+        Some(lm),
+        &audio,
+        None,
+        config.encodec_frame_batch_size,
+        false,
+        |chunk| {
+            encoded.extend_from_slice(chunk);
+            let _ = sender.send(Bytes::copy_from_slice(chunk));
+            Ok(())
+        },
+    )?;
+    Ok(encoded)
+}
+
 async fn run_encodec(config: &AppConfig, prepared: &PreparedEncodeProgram) -> Result<Bytes> {
     let config = config.clone();
     let prepared = prepared.clone();
@@ -655,6 +679,45 @@ async fn run_encodec(config: &AppConfig, prepared: &PreparedEncodeProgram) -> Re
         .await
         .context("encodec worker task panicked")?
         .map(Bytes::from)
+}
+
+pub fn start_streaming_encodec(
+    config: &AppConfig,
+    prepared: &PreparedEncodeProgram,
+) -> StreamingEncodeHandle {
+    let config = config.clone();
+    let prepared = prepared.clone();
+    let (sender, chunks) = mpsc::unbounded_channel();
+    let join = tokio::task::spawn_blocking(move || {
+        encode_with_onnx_runtime_streaming(&config, &prepared, sender).map(Bytes::from)
+    });
+    StreamingEncodeHandle { chunks, join }
+}
+
+impl StreamingEncodeHandle {
+    pub async fn finish(self) -> Result<Bytes> {
+        self.join.await.context("encodec worker task panicked")?
+    }
+}
+
+pub fn build_artifacts_from_ecdc(
+    config: &AppConfig,
+    prepared: &PreparedEncodeProgram,
+    ecdc: Bytes,
+) -> Result<EncodeArtifacts> {
+    let (png, png_side) = bytes_to_png(&ecdc)?;
+    Ok(EncodeArtifacts {
+        ecdc,
+        png,
+        png_side,
+        device_label: config.device_label(),
+        duration_seconds: prepared.duration_seconds,
+        quality: prepared.quality,
+        audio_key: prepared.audio_key.clone(),
+        track_count: prepared.track_count,
+        gap_seconds: prepared.gap_seconds,
+        total_gap_seconds: prepared.total_gap_seconds,
+    })
 }
 
 fn bytes_to_png(data: &[u8]) -> Result<(Bytes, usize)> {

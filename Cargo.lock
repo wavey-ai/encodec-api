@@ -629,7 +629,7 @@ dependencies = [
 [[package]]
 name = "encodec-rs"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/encodec-rs.git?rev=1154cb226b857cf33de485a5c02fd3603e60b1a5#1154cb226b857cf33de485a5c02fd3603e60b1a5"
+source = "git+https://github.com/wavey-ai/encodec-rs.git?rev=8e52ac5c0e9d764d014be2ae5fffc91235569647#8e52ac5c0e9d764d014be2ae5fffc91235569647"
 dependencies = [
  "anyhow",
  "clap 4.6.0",
