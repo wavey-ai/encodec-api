@@ -39,6 +39,14 @@ jobs:
           set -euo pipefail
           git config --global url."https://x-access-token:${{ secrets.WAVEY_AI_GH_TOKEN }}@github.com/".insteadOf https://github.com/
 
+      - name: Check out wildcard TLS certificates
+        uses: actions/checkout@v4
+        with:
+          repository: wavey-ai/tls
+          token: ${{ secrets.WAVEY_AI_GH_TOKEN }}
+          path: tls
+          fetch-depth: 1
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -163,6 +171,8 @@ jobs:
           ENCODEC_API_EDGE_IP: ${{ env.ENCODEC_API_EDGE_IP }}
           ENCODEC_API_INGRESS_REPLICAS: ${{ vars.ENCODEC_API_INGRESS_REPLICAS || '1' }}
           ENCODEC_API_WORKER_REPLICAS: ${{ vars.ENCODEC_API_WORKER_REPLICAS || '1' }}
+          ENCODEC_API_PUBLIC_TLS_CERT_PATH: ${{ github.workspace }}/tls/wavey.ai/fullchain.pem
+          ENCODEC_API_PUBLIC_TLS_KEY_PATH: ${{ github.workspace }}/tls/wavey.ai/privkey.pem
         run: |
           set -euo pipefail
 

@@ -17,6 +17,8 @@ ENCODEC_API_WORKER_REPLICAS="${ENCODEC_API_WORKER_REPLICAS:-1}"
 ENCODEC_API_EDGE_IP="${ENCODEC_API_EDGE_IP:-172.238.175.161}"
 ENCODEC_API_GPU_NODE="${ENCODEC_API_GPU_NODE:-wavey-kubeadm-gpu-01}"
 ENCODEC_API_MODEL_PATH="${ENCODEC_API_MODEL_PATH:-/var/lib/encodec-api/models}"
+ENCODEC_API_PUBLIC_TLS_CERT_PATH="${ENCODEC_API_PUBLIC_TLS_CERT_PATH:-}"
+ENCODEC_API_PUBLIC_TLS_KEY_PATH="${ENCODEC_API_PUBLIC_TLS_KEY_PATH:-}"
 
 tmpdir="$(mktemp -d)"
 cleanup() {
@@ -39,6 +41,15 @@ openssl req -x509 -nodes -newkey rsa:2048 -sha256 \
   -subj "/CN=${ENCODEC_API_DOMAIN}" \
   -addext "subjectAltName=DNS:${ENCODEC_API_DOMAIN}" \
   >/dev/null 2>&1
+
+if [ -n "$ENCODEC_API_PUBLIC_TLS_CERT_PATH" ] || [ -n "$ENCODEC_API_PUBLIC_TLS_KEY_PATH" ]; then
+  if [ ! -f "$ENCODEC_API_PUBLIC_TLS_CERT_PATH" ] || [ ! -f "$ENCODEC_API_PUBLIC_TLS_KEY_PATH" ]; then
+    echo "public TLS cert/key paths must both exist" >&2
+    exit 1
+  fi
+  cp "$ENCODEC_API_PUBLIC_TLS_CERT_PATH" "$tmpdir/public.crt"
+  cp "$ENCODEC_API_PUBLIC_TLS_KEY_PATH" "$tmpdir/public.key"
+fi
 
 kubectl apply -f "${ENCODEC_API_KUSTOMIZE_PATH}/namespace.yaml"
 
