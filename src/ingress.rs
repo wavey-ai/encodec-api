@@ -10,6 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::time::{interval, timeout, Duration};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tracing::{debug, info, warn};
 use upload_response::{
     response_content_type, CachedIngress, IngressProxyConfig, TailSlot, UploadResponseService,
 };
@@ -78,8 +79,15 @@ impl EncodeIngress {
             .await
             .map_err(anyhow_to_server_error)?;
         let stream_id = guard.stream_id();
+        info!(
+            stream_id,
+            path = %req.uri().path(),
+            direct_stream_decode = request_supports_stream_decode(&req),
+            "accepted streaming encode request"
+        );
 
         if let Err(error) = self.cache_request_body(stream_id, &req, body, true).await {
+            warn!(stream_id, error = %error, "failed to cache streaming request body");
             guard.close().await;
             return Err(anyhow_to_server_error(error));
         }
@@ -182,6 +190,13 @@ impl EncodeIngress {
         body: BodyStream,
         streaming: bool,
     ) -> Result<()> {
+        debug!(
+            stream_id,
+            path = %req.uri().path(),
+            direct_stream_decode = request_supports_stream_decode(req),
+            streaming,
+            "caching request body"
+        );
         if request_supports_stream_decode(req) {
             self.cache_streamed_direct_request(stream_id, req, body, streaming)
                 .await
@@ -253,6 +268,13 @@ impl EncodeIngress {
                 )
             })
             .await?;
+        info!(
+            stream_id,
+            quality = %quality.as_str(),
+            gap_seconds,
+            streaming,
+            "starting direct streamed decode to canonical PCM"
+        );
 
         let mut pipeline = DecodePipeline::spawn_with_buffers_and_options(
             1024,
@@ -264,6 +286,7 @@ impl EncodeIngress {
             },
         );
         let mut decoded_body_bytes = 0usize;
+        let mut upload_bytes = 0usize;
 
         while let Some(next) = body.next().await {
             let chunk =
@@ -271,6 +294,7 @@ impl EncodeIngress {
             if chunk.is_empty() {
                 continue;
             }
+            upload_bytes += chunk.len();
             self.send_decoder_chunk(stream_id, &mut pipeline, chunk, &mut decoded_body_bytes)
                 .await?;
         }
@@ -288,6 +312,10 @@ impl EncodeIngress {
         anyhow::ensure!(
             decoded_body_bytes > 0,
             "request body did not include decodable audio"
+        );
+        info!(
+            stream_id,
+            upload_bytes, decoded_body_bytes, "finished direct streamed decode to canonical PCM"
         );
 
         self.cached.end_request(stream_id).await
@@ -436,6 +464,11 @@ impl EncodeIngress {
                 .append_request_body_sliced(stream_id, audio.data(), chunk_size)
                 .await?;
         }
+        debug!(
+            stream_id,
+            decoded_body_bytes = *decoded_body_bytes,
+            "flushed decoder outputs"
+        );
         Ok(())
     }
 

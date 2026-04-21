@@ -54,7 +54,18 @@ spec:
               set -eu
               src="/opt/encodec-rs/onnx-bundles"
               dst="/var/lib/encodec-api/models/onnx-bundles"
-              if [ ! -f "${dst}/encodec_48khz_6kbps/bundle.json" ] || [ ! -f "${dst}/encodec_48khz_12kbps/bundle.json" ]; then
+              invalid_bundle() {
+                local file="$1"
+                [ ! -f "$file" ] || [ "$(wc -c < "$file")" -le 1048576 ]
+              }
+              if [ ! -f "${dst}/encodec_48khz_6kbps/bundle.json" ] || \
+                 [ ! -f "${dst}/encodec_48khz_12kbps/bundle.json" ] || \
+                 invalid_bundle "${dst}/encodec_48khz_6kbps/encode_frame.onnx" || \
+                 invalid_bundle "${dst}/encodec_48khz_6kbps/decode_frame.onnx" || \
+                 invalid_bundle "${dst}/encodec_48khz_6kbps/lm_logits.onnx" || \
+                 invalid_bundle "${dst}/encodec_48khz_12kbps/encode_frame.onnx" || \
+                 invalid_bundle "${dst}/encodec_48khz_12kbps/decode_frame.onnx" || \
+                 invalid_bundle "${dst}/encodec_48khz_12kbps/lm_logits.onnx"; then
                 rm -rf "${dst}"
                 mkdir -p "${dst}"
                 cp -R "${src}/." "${dst}/"
@@ -77,6 +88,12 @@ spec:
               test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/encode_frame.onnx
               test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/decode_frame.onnx
               test -f /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/lm_logits.onnx
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/encode_frame.onnx)" -gt 1048576 ]
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/decode_frame.onnx)" -gt 1048576 ]
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_6kbps/lm_logits.onnx)" -gt 1048576 ]
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/encode_frame.onnx)" -gt 1048576 ]
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/decode_frame.onnx)" -gt 1048576 ]
+              [ "$(wc -c < /var/lib/encodec-api/models/onnx-bundles/encodec_48khz_12kbps/lm_logits.onnx)" -gt 1048576 ]
           volumeMounts:
             - name: model
               mountPath: /var/lib/encodec-api/models

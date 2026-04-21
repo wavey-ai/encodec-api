@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use upload_response::{
     discover_ingress_origins, RemoteIngressClient, RemoteRequestSlot, RequestControl,
     ResponseCacheWriter,
@@ -289,6 +289,13 @@ impl WorkerState {
     ) -> Result<()> {
         let request_id = Uuid::new_v4().to_string();
         let artifact_selection = stream_artifact_selection(&request)?;
+        info!(
+            %origin,
+            stream_id,
+            request_id = %request_id,
+            artifact = %artifact_selection.as_str(),
+            "starting streaming encode request"
+        );
 
         writer
             .send_value(json!({
@@ -302,6 +309,13 @@ impl WorkerState {
         let body = self
             .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
             .await?;
+        info!(
+            %origin,
+            stream_id,
+            request_id = %request_id,
+            body_bytes = body.len(),
+            "received streamed upload body"
+        );
         let artifacts = if let Some(prepared) =
             prepared_program_from_internal_request(&request, &body)?
         {
@@ -351,6 +365,15 @@ impl WorkerState {
                 "ecdc_bytes": artifacts.ecdc.len(),
             }))
             .await?;
+        info!(
+            %origin,
+            stream_id,
+            request_id = %request_id,
+            duration = artifacts.duration_seconds,
+            ecdc_bytes = artifacts.ecdc.len(),
+            png_bytes = artifacts.png.len(),
+            "finished streaming encode request"
+        );
         writer.finish().await
     }
 
@@ -424,6 +447,13 @@ impl WorkerState {
                 "bytes_received": buffer.len(),
             }))
             .await?;
+        debug!(
+            %origin,
+            stream_id,
+            request_id,
+            bytes_received = buffer.len(),
+            "completed reading remote streaming request body"
+        );
 
         Ok(Bytes::from(buffer))
     }
@@ -490,6 +520,12 @@ impl WorkerState {
         let mut handle = start_streaming_encodec(&self.config, &prepared);
         let mut artifact_chunks = 0usize;
         let mut pending_ecdc = Vec::new();
+        info!(
+            request_id,
+            duration = prepared.duration_seconds,
+            bandwidth_kbps = prepared.quality.bandwidth_kbps(),
+            "encoding prepared streaming upload"
+        );
 
         if selection.includes_ecdc() {
             send_artifact_start(writer, request_id, "ecdc", "application/octet-stream", None)
@@ -517,6 +553,12 @@ impl WorkerState {
         }
 
         let ecdc = handle.finish().await?;
+        info!(
+            request_id,
+            ecdc_bytes = ecdc.len(),
+            artifact_chunks,
+            "finished streaming ECDC encode"
+        );
 
         if selection.includes_ecdc() {
             if !pending_ecdc.is_empty() {

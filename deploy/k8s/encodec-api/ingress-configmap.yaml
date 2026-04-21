@@ -14,4 +14,4 @@ data:
   UPLOAD_RESPONSE_SLOTS_PER_STREAM: "512"
   UPLOAD_RESPONSE_TIMEOUT_MS: "1800000"
   UPLOAD_RESPONSE_WATCH_POLL_MS: "2"
-  RUST_LOG: encodec_api=info,web_service=info,upload_response=info
+  RUST_LOG: encodec_api=debug,web_service=debug,upload_response=trace

@@ -17,4 +17,4 @@ data:
   UPLOAD_RESPONSE_DISCOVERY_DNS: encodec-api-ingress-internal.encodec-api.svc.cluster.local:8443
   UPLOAD_RESPONSE_DISCOVERY_INTERVAL_MS: "2000"
   UPLOAD_RESPONSE_INSECURE_TLS: "true"
-  RUST_LOG: encodec_api=info,web_service=info,upload_response=info
+  RUST_LOG: encodec_api=debug,web_service=info,upload_response=debug

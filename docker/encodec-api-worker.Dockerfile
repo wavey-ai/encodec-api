@@ -42,11 +42,21 @@ RUN --mount=type=secret,id=github_token \
     fi; \
     cargo build --release --locked
 
+COPY --from=encodec_rs /onnx-bundles /app/onnx-bundles
+
 RUN set -eu; \
-    bundle_root="$(find "${CARGO_HOME}/git/checkouts" -maxdepth 4 -type d -path '*/onnx-bundles' | head -n 1)"; \
-    test -n "${bundle_root}"; \
-    mkdir -p /app/onnx-bundles; \
-    cp -R "${bundle_root}/." /app/onnx-bundles/
+    test -f /app/onnx-bundles/encodec_48khz_6kbps/encode_frame.onnx; \
+    test -f /app/onnx-bundles/encodec_48khz_6kbps/decode_frame.onnx; \
+    test -f /app/onnx-bundles/encodec_48khz_6kbps/lm_logits.onnx; \
+    test -f /app/onnx-bundles/encodec_48khz_12kbps/encode_frame.onnx; \
+    test -f /app/onnx-bundles/encodec_48khz_12kbps/decode_frame.onnx; \
+    test -f /app/onnx-bundles/encodec_48khz_12kbps/lm_logits.onnx; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_6kbps/encode_frame.onnx)" -gt 1048576 ]; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_6kbps/decode_frame.onnx)" -gt 1048576 ]; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_6kbps/lm_logits.onnx)" -gt 1048576 ]; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_12kbps/encode_frame.onnx)" -gt 1048576 ]; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_12kbps/decode_frame.onnx)" -gt 1048576 ]; \
+    [ "$(wc -c < /app/onnx-bundles/encodec_48khz_12kbps/lm_logits.onnx)" -gt 1048576 ]
 
 FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
