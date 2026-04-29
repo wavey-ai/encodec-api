@@ -163,6 +163,7 @@ pub struct StreamingEncodeHandle {
 
 pub struct IncrementalStreamingEncodeHandle {
     pub chunks: UnboundedReceiver<Bytes>,
+    pub preview_snapshots: UnboundedReceiver<Bytes>,
     input: std_mpsc::Sender<Option<Bytes>>,
     join: JoinHandle<Result<Bytes>>,
 }
@@ -789,6 +790,7 @@ fn encode_streamed_pcm_with_onnx_runtime(
     prepared: &PreparedRequestEnvelope,
     input: std_mpsc::Receiver<Option<Bytes>>,
     sender: mpsc::UnboundedSender<Bytes>,
+    preview_sender: mpsc::UnboundedSender<Bytes>,
 ) -> Result<Vec<u8>> {
     let runtime = load_onnx_runtime(config, prepared.quality)?;
     let mut runtime = runtime
@@ -842,6 +844,7 @@ fn encode_streamed_pcm_with_onnx_runtime(
                     total_pcm_bytes,
                     bytes_per_frame
                 );
+                let encoded_before = buffered_chunks.len();
                 pump_ready_segment_batches(
                     frame,
                     Some(lm),
@@ -857,6 +860,17 @@ fn encode_streamed_pcm_with_onnx_runtime(
                         Ok(())
                     },
                 )?;
+                if buffered_chunks.len() > encoded_before {
+                    let mut preview_ecdc = encode_ecdc_header_with_options(
+                        frame,
+                        total_pcm_bytes / bytes_per_frame,
+                        None,
+                        true,
+                        false,
+                    )?;
+                    preview_ecdc.extend_from_slice(&buffered_chunks);
+                    let _ = preview_sender.send(Bytes::from(preview_ecdc));
+                }
             }
             None => break,
         }
@@ -922,12 +936,21 @@ pub fn start_incremental_streaming_encodec(
     let config = config.clone();
     let prepared = prepared.clone();
     let (sender, chunks) = mpsc::unbounded_channel();
+    let (preview_sender, preview_snapshots) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = std_mpsc::channel();
     let join = tokio::task::spawn_blocking(move || {
-        encode_streamed_pcm_with_onnx_runtime(&config, &prepared, input_rx, sender).map(Bytes::from)
+        encode_streamed_pcm_with_onnx_runtime(
+            &config,
+            &prepared,
+            input_rx,
+            sender,
+            preview_sender,
+        )
+        .map(Bytes::from)
     });
     IncrementalStreamingEncodeHandle {
         chunks,
+        preview_snapshots,
         input: input_tx,
         join,
     }
