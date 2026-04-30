@@ -2,17 +2,18 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
+use gpu_worker_upload_response::{
+    run_remote_worker_loop, PipelineSpec, RemoteJob, RemoteJobProcessor, RemoteWorkerConfig,
+    SinkLane, SourceLane,
+};
 use http::{header::CONTENT_TYPE, Request, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::task::JoinSet;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use upload_response::{
-    discover_ingress_origins, RemoteIngressClient, RemoteRequestSlot, RequestControl,
-    ResponseCacheWriter,
+    RemoteIngressClient, RemoteRequestSlot, RequestControl, ResponseCacheWriter,
 };
 use uuid::Uuid;
 use web_service::HandlerResponse;
@@ -53,6 +54,25 @@ impl WorkerState {
         })
     }
 
+    fn remote_worker_config(&self) -> RemoteWorkerConfig {
+        let mut config = RemoteWorkerConfig::new(
+            self.config.upload_response_worker_id.clone(),
+            PipelineSpec {
+                source: SourceLane::Request,
+                sink: SinkLane::Response,
+            },
+        );
+        config.heartbeat_stage = "response".to_string();
+        config.max_inflight = self.config.upload_response_max_inflight;
+        config.poll_interval =
+            Duration::from_millis(self.config.upload_response_worker_poll_ms.max(1));
+        config.discovery_interval =
+            Duration::from_millis(self.config.upload_response_discovery_interval_ms.max(1));
+        config.ingress_urls = self.config.upload_response_ingress_urls.clone();
+        config.discovery_dns = self.config.upload_response_discovery_dns.clone();
+        config
+    }
+
     async fn run_remote_cache_worker(self: Arc<Self>) {
         let client = match RemoteIngressClient::new(
             self.config.upload_response_config().slot_bytes(),
@@ -64,158 +84,26 @@ impl WorkerState {
                 return;
             }
         };
+        run_remote_worker_loop(client, self.remote_worker_config(), self).await;
+    }
 
-        let mut poll = interval(Duration::from_millis(
-            self.config.upload_response_worker_poll_ms.max(1),
-        ));
-        let mut discovery = interval(Duration::from_millis(
-            self.config.upload_response_discovery_interval_ms.max(1),
-        ));
-        let mut inflight = HashSet::new();
-        let mut tasks = JoinSet::new();
-        let mut origins: Vec<String> = Vec::new();
-        let mut refresh_origins = true;
-
-        loop {
-            tokio::select! {
-                _ = poll.tick() => {}
-                _ = discovery.tick() => {
-                    refresh_origins = true;
-                }
-            }
-
-            if refresh_origins {
-                match discover_ingress_origins(
-                    &self.config.upload_response_ingress_urls,
-                    self.config.upload_response_discovery_dns.as_deref(),
-                )
-                .await
-                {
-                    Ok(next) => {
-                        if next != origins {
-                            debug!(origins = ?next, "updated encode ingress origins");
-                        }
-                        origins = next;
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "failed to discover ingress origins");
-                    }
-                }
-                refresh_origins = false;
-            }
-
-            while let Some(joined) = tasks.try_join_next() {
-                match joined {
-                    Ok(key) => {
-                        inflight.remove(&key);
-                    }
-                    Err(error) => {
-                        error!(%error, "remote encode worker task failed");
-                    }
-                }
-            }
-
-            if inflight.len() >= self.config.upload_response_max_inflight {
-                continue;
-            }
-
-            for origin in &origins {
-                if inflight.len() >= self.config.upload_response_max_inflight {
-                    break;
-                }
-
-                let streams = match client.list_streams(origin).await {
-                    Ok(streams) => streams,
-                    Err(error) => {
-                        warn!(origin, error = %error, "failed to list remote streams");
-                        continue;
-                    }
-                };
-
-                for stream in streams {
-                    if inflight.len() >= self.config.upload_response_max_inflight {
-                        break;
-                    }
-                    if stream.request_last == 0 || stream.response_owner.is_some() {
-                        continue;
-                    }
-
-                    let inflight_key = format!("{}#{}", origin, stream.stream_id);
-                    if inflight.contains(&inflight_key) {
-                        continue;
-                    }
-
-                    match client
-                        .try_claim_response(
-                            origin,
-                            stream.stream_id,
-                            &self.config.upload_response_worker_id,
-                        )
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(error) => {
-                            warn!(
-                                origin,
-                                stream_id = stream.stream_id,
-                                error = %error,
-                                "failed to claim remote encode response"
-                            );
-                            continue;
-                        }
-                    }
-
-                    let _ = client
-                        .register_reader(
-                            origin,
-                            stream.stream_id,
-                            &self.config.upload_response_worker_id,
-                        )
-                        .await;
-
-                    inflight.insert(inflight_key.clone());
-                    let worker = self.clone();
-                    let client = client.clone();
-                    let worker_id = self.config.upload_response_worker_id.clone();
-                    let origin = origin.clone();
-                    tasks.spawn(async move {
-                        let result = worker
-                            .process_remote_stream(&client, &origin, stream.stream_id)
-                            .await;
-                        if let Err(error) = result {
-                            error!(
-                                origin,
-                                stream_id = stream.stream_id,
-                                error = %error,
-                                "remote cached encode failed"
-                            );
-                            let response =
-                                error_response(classify_error(&error), error.to_string());
-                            if let Err(write_error) = client
-                                .write_handler_response(&origin, stream.stream_id, response)
-                                .await
-                            {
-                                error!(
-                                    origin,
-                                    stream_id = stream.stream_id,
-                                    error = %write_error,
-                                    "failed to write remote cached error response"
-                                );
-                                let _ = client
-                                    .release_response(&origin, stream.stream_id, &worker_id)
-                                    .await;
-                            }
-                        }
-
-                        let _ = client
-                            .unregister_reader(&origin, stream.stream_id, &worker_id)
-                            .await;
-                        inflight_key
-                    });
-                }
-            }
+    async fn process_remote_job(&self, job: RemoteJob) -> Result<()> {
+        if let Err(error) = self
+            .process_remote_stream(job.client(), &job.origin, job.stream_id)
+            .await
+        {
+            error!(
+                origin = %job.origin,
+                stream_id = job.stream_id,
+                error = %error,
+                "remote cached encode failed"
+            );
+            let response = error_response(classify_error(&error), error.to_string());
+            job.client()
+                .write_handler_response(&job.origin, job.stream_id, response)
+                .await?;
         }
+        Ok(())
     }
 
     async fn process_remote_stream(
@@ -889,5 +777,12 @@ fn classify_error(error: &anyhow::Error) -> StatusCode {
         StatusCode::BAD_REQUEST
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+#[async_trait]
+impl RemoteJobProcessor for WorkerState {
+    async fn process(&self, job: RemoteJob) -> Result<()> {
+        self.process_remote_job(job).await
     }
 }
