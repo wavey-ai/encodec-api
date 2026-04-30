@@ -4,17 +4,15 @@ use base64::Engine as _;
 use bytes::Bytes;
 use gpu_worker_upload_response::{
     run_remote_worker_loop, PipelineSpec, RemoteJob, RemoteJobProcessor, RemoteWorkerConfig,
-    SinkLane, SourceLane,
+    SinkLane, SourceFrame, SourceLane,
 };
 use http::{header::CONTENT_TYPE, Request, StatusCode};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::{debug, error, info};
-use upload_response::{
-    RemoteIngressClient, RemoteRequestSlot, RequestControl, ResponseCacheWriter,
-};
+use upload_response::{RemoteIngressClient, RequestControl, ResponseCacheWriter};
 use uuid::Uuid;
 use web_service::HandlerResponse;
 
@@ -88,10 +86,7 @@ impl WorkerState {
     }
 
     async fn process_remote_job(&self, job: RemoteJob) -> Result<()> {
-        if let Err(error) = self
-            .process_remote_stream(job.client(), &job.origin, job.stream_id)
-            .await
-        {
+        if let Err(error) = self.process_remote_stream(&job).await {
             error!(
                 origin = %job.origin,
                 stream_id = job.stream_id,
@@ -106,16 +101,14 @@ impl WorkerState {
         Ok(())
     }
 
-    async fn process_remote_stream(
-        &self,
-        client: &RemoteIngressClient,
-        origin: &str,
-        stream_id: u64,
-    ) -> Result<()> {
-        let request = client
-            .request_headers(origin, stream_id)
+    async fn process_remote_stream(&self, job: &RemoteJob) -> Result<()> {
+        let stream_id = job.stream_id;
+        let request = job
+            .request()
             .await?
             .ok_or_else(|| anyhow::anyhow!("request headers missing for stream {stream_id}"))?;
+        let client = job.client();
+        let origin = job.origin.as_str();
 
         if is_streaming_request(&request) {
             let mut writer = JsonLineResponseWriter::remote(
@@ -124,14 +117,10 @@ impl WorkerState {
                 stream_id,
                 client.slot_bytes(),
             );
-            return self
-                .stream_remote_upload(client, origin, stream_id, request, &mut writer)
-                .await;
+            return self.stream_remote_upload(job, request, &mut writer).await;
         }
 
-        let body = self
-            .read_remote_request_body(client, origin, stream_id)
-            .await?;
+        let body = self.read_remote_request_body(job).await?;
         let mut progress: Option<&mut (dyn ProgressSink + Send)> = None;
         let artifacts =
             if let Some(prepared) = prepared_program_from_internal_request(&request, &body)? {
@@ -172,12 +161,12 @@ impl WorkerState {
 
     async fn stream_remote_upload(
         &self,
-        client: &RemoteIngressClient,
-        origin: &str,
-        stream_id: u64,
+        job: &RemoteJob,
         request: Request<()>,
         writer: &mut JsonLineResponseWriter,
     ) -> Result<()> {
+        let origin = job.origin.as_str();
+        let stream_id = job.stream_id;
         let request_id = Uuid::new_v4().to_string();
         let artifact_selection = stream_artifact_selection(&request)?;
         info!(
@@ -201,9 +190,7 @@ impl WorkerState {
             prepared_request_envelope_from_internal_request(&request)?
         {
             self.process_streaming_prepared_remote_upload(
-                client,
-                origin,
-                stream_id,
+                job,
                 request_id.as_str(),
                 artifact_selection,
                 prepared,
@@ -212,7 +199,7 @@ impl WorkerState {
             .await?
         } else {
             let body = self
-                .read_remote_streaming_request_body(client, origin, stream_id, writer, &request_id)
+                .read_remote_streaming_request_body(job, writer, &request_id)
                 .await?;
             info!(
                 %origin,
@@ -263,60 +250,50 @@ impl WorkerState {
 
     async fn read_remote_streaming_request_body(
         &self,
-        client: &RemoteIngressClient,
-        origin: &str,
-        stream_id: u64,
+        job: &RemoteJob,
         writer: &mut JsonLineResponseWriter,
         request_id: &str,
     ) -> Result<Bytes> {
-        let mut poll = interval(Duration::from_millis(
-            self.config.upload_response_worker_poll_ms.max(1),
-        ));
-        let mut last_slot = 1usize;
+        let mut reader = job.source_reader_from(
+            1,
+            Duration::from_millis(self.config.upload_response_worker_poll_ms.max(1)),
+        );
         let mut buffer = Vec::new();
         let mut last_reported_bytes = 0usize;
+        let origin = job.origin.as_str();
+        let stream_id = job.stream_id;
 
-        'stream: loop {
-            poll.tick().await;
-            let current_last = client.request_last(origin, stream_id).await?;
-            if current_last <= last_slot {
-                continue;
-            }
-
-            for slot_id in (last_slot + 1)..=current_last {
-                match client.request_slot(origin, stream_id, slot_id).await? {
-                    Some(RemoteRequestSlot::Body(bytes)) => {
-                        buffer.extend_from_slice(&bytes);
-                        if buffer.len().saturating_sub(last_reported_bytes)
-                            >= STREAM_UPLOAD_PROGRESS_BYTES
-                        {
-                            last_reported_bytes = buffer.len();
-                            writer
-                                .send_value(json!({
-                                    "type": "UploadProgress",
-                                    "request_id": request_id,
-                                    "bytes_received": buffer.len(),
-                                }))
-                                .await?;
-                        }
-                    }
-                    Some(RemoteRequestSlot::Control(RequestControl::Finalize)) => {
+        while let Some(frame) = reader.next_frame().await? {
+            match frame {
+                SourceFrame::Body(bytes) => {
+                    buffer.extend_from_slice(&bytes);
+                    if buffer.len().saturating_sub(last_reported_bytes)
+                        >= STREAM_UPLOAD_PROGRESS_BYTES
+                    {
+                        last_reported_bytes = buffer.len();
                         writer
                             .send_value(json!({
                                 "type": "UploadProgress",
                                 "request_id": request_id,
                                 "bytes_received": buffer.len(),
-                                "finalize": true,
                             }))
                             .await?;
                     }
-                    Some(RemoteRequestSlot::Control(RequestControl::KeepAlive)) => {}
-                    Some(RemoteRequestSlot::End) => break 'stream,
-                    Some(RemoteRequestSlot::Headers(_)) | None => {}
                 }
+                SourceFrame::Control(RequestControl::Finalize) => {
+                    writer
+                        .send_value(json!({
+                            "type": "UploadProgress",
+                            "request_id": request_id,
+                            "bytes_received": buffer.len(),
+                            "finalize": true,
+                        }))
+                        .await?;
+                }
+                SourceFrame::Control(RequestControl::KeepAlive) => {}
+                SourceFrame::End => break,
+                SourceFrame::RequestHeaders(_) | SourceFrame::StageHead(_) => {}
             }
-
-            last_slot = current_last;
         }
 
         anyhow::ensure!(
@@ -342,35 +319,20 @@ impl WorkerState {
         Ok(Bytes::from(buffer))
     }
 
-    async fn read_remote_request_body(
-        &self,
-        client: &RemoteIngressClient,
-        origin: &str,
-        stream_id: u64,
-    ) -> Result<Bytes> {
-        let mut poll = interval(Duration::from_millis(
-            self.config.upload_response_worker_poll_ms.max(1),
-        ));
-        let mut last_slot = 1usize;
+    async fn read_remote_request_body(&self, job: &RemoteJob) -> Result<Bytes> {
+        let mut reader = job.source_reader_from(
+            1,
+            Duration::from_millis(self.config.upload_response_worker_poll_ms.max(1)),
+        );
         let mut buffer = Vec::new();
 
-        'stream: loop {
-            poll.tick().await;
-            let current_last = client.request_last(origin, stream_id).await?;
-            if current_last <= last_slot {
-                continue;
+        while let Some(frame) = reader.next_frame().await? {
+            match frame {
+                SourceFrame::Body(bytes) => buffer.extend_from_slice(&bytes),
+                SourceFrame::Control(_) => {}
+                SourceFrame::End => break,
+                SourceFrame::RequestHeaders(_) | SourceFrame::StageHead(_) => {}
             }
-
-            for slot_id in (last_slot + 1)..=current_last {
-                match client.request_slot(origin, stream_id, slot_id).await? {
-                    Some(RemoteRequestSlot::Body(bytes)) => buffer.extend_from_slice(&bytes),
-                    Some(RemoteRequestSlot::Control(_)) => {}
-                    Some(RemoteRequestSlot::End) => break 'stream,
-                    Some(RemoteRequestSlot::Headers(_)) | None => {}
-                }
-            }
-
-            last_slot = current_last;
         }
 
         Ok(Bytes::from(buffer))
@@ -378,14 +340,14 @@ impl WorkerState {
 
     async fn process_streaming_prepared_remote_upload(
         &self,
-        client: &RemoteIngressClient,
-        origin: &str,
-        stream_id: u64,
+        job: &RemoteJob,
         request_id: &str,
         selection: StreamArtifactSelection,
         prepared: PreparedRequestEnvelope,
         writer: &mut JsonLineResponseWriter,
     ) -> Result<EncodeArtifacts> {
+        let origin = job.origin.as_str();
+        let stream_id = job.stream_id;
         writer
             .send_value(json!({
                 "type": "Progress",
@@ -403,10 +365,10 @@ impl WorkerState {
             .await?;
 
         let mut handle = start_incremental_streaming_encodec(&self.config, &prepared);
-        let mut poll = interval(Duration::from_millis(
-            self.config.upload_response_worker_poll_ms.max(1),
-        ));
-        let mut last_slot = 1usize;
+        let mut reader = job.source_reader_from(
+            1,
+            Duration::from_millis(self.config.upload_response_worker_poll_ms.max(1)),
+        );
         let mut last_reported_bytes = 0usize;
         let mut bytes_received = 0usize;
         let mut digest = Sha256::new();
@@ -424,53 +386,43 @@ impl WorkerState {
                 .await?;
         }
 
-        'stream: loop {
-            poll.tick().await;
-            let current_last = client.request_last(origin, stream_id).await?;
-            if current_last <= last_slot {
-                continue;
-            }
-
-            for slot_id in (last_slot + 1)..=current_last {
-                match client.request_slot(origin, stream_id, slot_id).await? {
-                    Some(RemoteRequestSlot::Body(bytes)) => {
-                        if bytes.is_empty() {
-                            continue;
-                        }
-                        saw_body = true;
-                        bytes_received += bytes.len();
-                        digest.update(&bytes);
-                        handle.send_pcm_chunk(bytes)?;
-                        if bytes_received.saturating_sub(last_reported_bytes)
-                            >= STREAM_UPLOAD_PROGRESS_BYTES
-                        {
-                            last_reported_bytes = bytes_received;
-                            writer
-                                .send_value(json!({
-                                    "type": "UploadProgress",
-                                    "request_id": request_id,
-                                    "bytes_received": bytes_received,
-                                }))
-                                .await?;
-                        }
+        while let Some(frame) = reader.next_frame().await? {
+            match frame {
+                SourceFrame::Body(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
                     }
-                    Some(RemoteRequestSlot::Control(RequestControl::Finalize)) => {
+                    saw_body = true;
+                    bytes_received += bytes.len();
+                    digest.update(&bytes);
+                    handle.send_pcm_chunk(bytes)?;
+                    if bytes_received.saturating_sub(last_reported_bytes)
+                        >= STREAM_UPLOAD_PROGRESS_BYTES
+                    {
+                        last_reported_bytes = bytes_received;
                         writer
                             .send_value(json!({
                                 "type": "UploadProgress",
                                 "request_id": request_id,
                                 "bytes_received": bytes_received,
-                                "finalize": true,
                             }))
                             .await?;
                     }
-                    Some(RemoteRequestSlot::Control(RequestControl::KeepAlive)) => {}
-                    Some(RemoteRequestSlot::End) => break 'stream,
-                    Some(RemoteRequestSlot::Headers(_)) | None => {}
                 }
+                SourceFrame::Control(RequestControl::Finalize) => {
+                    writer
+                        .send_value(json!({
+                            "type": "UploadProgress",
+                            "request_id": request_id,
+                            "bytes_received": bytes_received,
+                            "finalize": true,
+                        }))
+                        .await?;
+                }
+                SourceFrame::Control(RequestControl::KeepAlive) => {}
+                SourceFrame::End => break,
+                SourceFrame::RequestHeaders(_) | SourceFrame::StageHead(_) => {}
             }
-
-            last_slot = current_last;
         }
 
         anyhow::ensure!(saw_body, "request body did not include audio bytes");
