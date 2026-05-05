@@ -939,14 +939,8 @@ pub fn start_incremental_streaming_encodec(
     let (preview_sender, preview_snapshots) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = std_mpsc::channel();
     let join = tokio::task::spawn_blocking(move || {
-        encode_streamed_pcm_with_onnx_runtime(
-            &config,
-            &prepared,
-            input_rx,
-            sender,
-            preview_sender,
-        )
-        .map(Bytes::from)
+        encode_streamed_pcm_with_onnx_runtime(&config, &prepared, input_rx, sender, preview_sender)
+            .map(Bytes::from)
     });
     IncrementalStreamingEncodeHandle {
         chunks,
