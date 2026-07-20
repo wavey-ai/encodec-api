@@ -25,8 +25,10 @@ Notes:
 - `encodec-api` deploys to the shared Wavey self-managed kubeadm cluster on Linode.
 - The deploy workflow reads a kubeconfig from GitHub secrets, applies the Kubernetes manifests, and upserts `encodec.wavey.ai` to the CPU ingress node IP in Linode DNS.
 - Ingress is CPU-only and is responsible for upload parsing, media decode, and canonical PCM preparation through `av-api` + `soundkit`.
-- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`; they run pure-Rust `encodec-rs`.
-- ONNX bundles are stored on a static local persistent volume pinned to the GPU node and seeded into that volume from the worker image on first deployment.
+- Worker pods are GPU-targeted and request `nvidia.com/gpu: 1`. They run pure-Rust `encodec-rs`.
+- ONNX bundles are stored on a static local persistent volume on the GPU node.
+  The first deployment copies them from the worker image to that volume.
+
 - The worker path no longer shells out to Python or an external `encodec` binary.
 
 ## GitHub secrets and variables
